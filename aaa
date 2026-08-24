@@ -1,0 +1,3700 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+V12.5 neutral geometry/contact analysis for the Fe/O/chiral-ligand + substrate system.
+
+python contact_geometry_v12_5_exact_screenshot_eda.py \
+    --structures con_S step_R \
+    --eda EDA.csv \
+    --cat-ref cat.xyz \
+    --sub-ref styrene.xyz
+
+The main change from V5 is SEMANTIC, not merely cosmetic:
+
+1) A negative vdW gap is called a geometric vdW overlap, NOT a steric penalty.
+   vdW overlap does not by itself imply favorable or unfavorable interaction energy.
+
+2) Contacts between the reactive O atoms and substrate atoms, after excluding the
+   two assigned primary forming C-O pairs, are called SECONDARY O contacts.
+   "Secondary" only means "not one of the two assigned primary C-O pairs".
+   It does NOT mean nonbonding, repulsive, or unimportant.
+
+3) Secondary O contacts are split by substrate element (O...H, O...C, O...N,
+   and O...other) and are also written as a long contact table for inspection.
+
+4) "heavy" naming is made explicit:
+      subheavy_ligall = substrate heavy atoms vs all ligand atoms
+      suball_ligall   = all substrate atoms vs all ligand atoms
+
+5) The old mapping_geometry_RMS_A name is replaced by
+   mapping_distance_matrix_RMS_A because the score is based on internal
+   pair-distance differences, not a Kabsch coordinate RMSD.
+
+6) Group-level vdW-overlap sums are accompanied by per-substrate-atom values,
+   because symmetry groups have different sizes.
+
+7) The O-C-C-O torsion is kept in three forms:
+      signed angle
+      absolute angle
+      twist from coplanarity = min(|phi|, 180-|phi|)
+   The last one intentionally discards syn/anti information.
+
+System indexing (edit if needed):
+  1       Fe
+  2-62    chiral ligand
+  63-64   reactive O atoms
+  65-end  substrate
+
+IMPORTANT CHEMICAL CAVEAT
+-------------------------
+The contact descriptors in this script are GEOMETRIC descriptors only.
+A short O...N, O...H, O...C, or ligand...substrate contact may be attractive,
+repulsive, partially bonding, dispersive, electrostatic, or mixed. Assigning
+its energetic sign requires electronic-structure analysis (EDA/NBO/NCI/IGMH,
+etc.), not the vdW-gap criterion itself.
+"""
+
+import argparse
+import csv
+import itertools
+import math
+import os
+import re
+from pathlib import Path
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+FILES = {
+    "con_R":       "con_R_reordered.xyz",
+    "con_R_Q23":   "con_R_Q23_reordered.xyz",
+    "con_S":       "con_S_reordered.xyz",
+    "con_S_Q23":   "con_S_Q23_reordered.xyz",
+    "step_R":      "step_R_reordered.xyz",
+    "step_R_Q2":   "step_R_Q2_reordered.xyz",
+    "step_R_Q3":   "step_R_Q3_reordered.xyz",
+    "step_R_Q4":   "step_R_Q4_reordered.xyz",
+    "step_S":      "step_S_reordered.xyz",
+    "step_S_Q4":   "step_S_Q4_reordered.xyz",
+}
+
+REFERENCE = "step_R"
+FE_INDEX = 1
+LIG_START = 2
+LIG_END = 62
+REACTIVE_O = (63, 64)
+SUB_START = 65
+
+# If known, set the two substrate carbons that form the two primary C-O bonds
+# in REFERENCE atom numbering, e.g. (65, 67). None = auto-detect.
+FORMING_C_REF = None
+
+# Optional chemically fixed O assignment.
+# Example, if reference C65 must pair with O64 and C67 with O63:
+# FORMING_O_FOR_REF_C = {65: 64, 67: 63}
+# None = choose the O/C assignment with the shorter total C-O distance in
+# each structure. If O63 and O64 are chemically inequivalent, FIX THIS MANUALLY.
+FORMING_O_FOR_REF_C = None
+
+# Used ONLY to infer connectivity for substrate graph mapping / H assignment.
+BOND_SCALE = 1.25
+MAX_MAPPINGS = 10000
+
+# Purely operational proximity window:
+# a pair is "proximity" when vdW_gap <= PROXIMITY_GAP_A.
+# This cutoff has no intrinsic energetic meaning.
+PROXIMITY_GAP_A = 0.30
+TOP_N = 8
+
+# Output names
+GROUPS_SUBHEAVY_OUT = "groups_subheavy_v12_5.csv"
+GROUPS_SUBALL_OUT = "groups_suball_v12_5.csv"
+MODEL_OUT = "model_descriptors_v12_5.csv"
+SECONDARY_O_LONG_OUT = "secondary_O_contacts_v12_5.csv"
+LIGAND_LONG_OUT = "ligand_substrate_contacts_v12_5.csv"
+PRIMARY_PAIRS_OUT = "primary_forming_pairs_v12_5.csv"
+
+# ------------------------------------------------------------------
+# Two ligand methyl groups of special mechanistic interest.
+#
+# Set each value to the METHYL CARBON atom index in the REFERENCE XYZ only.
+# Atom numbering is allowed to differ between structures. V12 graph-maps the
+# ligand heavy atoms from REFERENCE to every target structure, then finds the
+# three H atoms attached to the mapped methyl carbon in that target structure.
+#
+# Example:
+# METHYL_CENTERS = {
+#     "quinoline_Me": 24,
+#     "pyridine_Me": 41,
+# }
+#
+# Leave as None for the first run if you do not know the atom numbers.
+# The script will write/print all detected ligand methyl-carbon candidates,
+# but it will NOT guess which one is quinoline vs pyridine.
+METHYL_CENTERS = {
+    "quinoline_Me": 20,
+    "pyridine_Me": 59,
+}
+
+# Direction used for pair descriptors. Positive signed shift means the
+# reaction-center midpoint is displaced from the quinoline-Me side toward
+# the pyridine-Me side along the methyl-C...methyl-C axis.
+METHYL_PAIR_ORDER = ("quinoline_Me", "pyridine_Me")
+
+# ------------------------------------------------------------------
+# Substrate phenyl ring used for methyl-vs-substrate CONFORMATION descriptors.
+#
+# IMPORTANT conceptual distinction:
+# - the midpoint of the two forming alkene carbons is retained as a reaction-
+#   coordinate descriptor;
+# - for the two ligand methyl groups vs substrate orientation, the PHENYL RING
+#   centroid/plane is the preferred reference.
+#
+# Set to the six phenyl-ring carbon atom indices in REFERENCE numbering if known.
+# The six indices may be supplied in ANY order; the script will reorder them into
+# cyclic bonded order automatically.  None = auto-detect a six-member all-carbon
+# substrate ring.  If several candidates exist, the script chooses the one
+# closest in graph connectivity to the forming alkene carbons and reports all
+# candidates so you can verify the choice chemically.
+PHENYL_RING_REF = None
+PHENYL_RING_OUT = "substrate_phenyl_ring_mapping_v12_5.csv"
+
+METHYL_CANDIDATES_OUT = "ligand_methyl_candidates_v12_5.csv"
+METHYL_LONG_OUT = "methyl_substrate_contacts_v12_5.csv"
+METHYL_MAPPING_OUT = "methyl_mapping_report_v12_5.csv"
+
+# ------------------------------------------------------------------
+# V12 additions: fragment RMSD + phenyl/ligand contact area.
+#
+# RMSD definitions:
+#   cat_FeLig_heavy_internal_RMSD_A
+#       independent best-fit RMSD of Fe + ligand heavy atoms vs REFERENCE.
+#   cat_FeLigO_heavy_internal_RMSD_A
+#       independent best-fit RMSD of Fe + ligand heavy atoms + reactive O63/O64.
+#   substrate_heavy_internal_RMSD_A
+#       independent best-fit RMSD of substrate heavy atoms vs REFERENCE.
+#   substrate_heavy_pose_RMSD_after_FeLig_alignment_A
+#       target is aligned ONLY on Fe + ligand heavy atoms, then substrate RMSD is
+#       measured without a second fit. This reports substrate placement in the pocket.
+#
+# Contact-area definition:
+#   Approximate buried solvent-accessible surface area (SASA) between the substrate
+#   phenyl group and ligand atoms (2-62), using a Shrake-Rupley-style point sampling.
+#   This is a geometric interface-area descriptor, not an interaction energy.
+STRUCTURE_METRICS_OUT = "rmsd_phenyl_ligand_area_v12_5.csv"
+SASA_PROBE_A = 1.40
+SASA_N_POINTS = 960
+PHENYL_CONTACT_INCLUDE_ATTACHED_H = True
+
+# ------------------------------------------------------------------
+# V12 atom-resolved deformation analysis.
+#
+# DEFORMATION_CORE_REF controls the rigid-body alignment used to localize
+# catalyst deformation relative to isolated caT.XYZ. None = auto-detect Fe +
+# the four ligand N atoms nearest to Fe in caT.XYZ. Or specify reference indices,
+# e.g. (1, 3, 4, 28, 29).
+#
+# Two complementary catalyst displacement measures are written:
+#   1) after best-fit alignment of Fe + ligand-heavy + O63/O64
+#      -> per-atom d^2 contributions sum exactly to the V12 catalyst RMSD^2
+#   2) after Fe+N4-core alignment
+#      -> easier to see which ligand wing / reactive O actually moves
+#
+# Atom-resolved catalyst/substrate rankings are referenced to isolated caT.XYZ /
+# sub.xyz. The older V11 cross-structure pose RMSDs remain in the descriptor table.
+DEFORMATION_CORE_REF = None
+CAT_ATOM_DISP_OUT = "catalyst_atom_displacement_v12_5.csv"
+SUB_ATOM_DISP_OUT = "substrate_atom_displacement_v12_5.csv"
+DEFORMATION_TOP_N = 15
+
+# ------------------------------------------------------------------
+# V12 additions: isolated-fragment references + EDA table.
+#
+# IMPORTANT: atom-resolved deformation is now referenced to the isolated
+# fragments used for preparation/distortion analysis, NOT to another TS.
+# The defaults can be overridden from the command line.
+CAT_REFERENCE_XYZ = "caT.XYZ"
+SUB_REFERENCE_XYZ = "sub.xyz"
+EDA_TABLE = "EDA.csv"
+
+EDA_SELECTED_OUT = "eda_selected_v12_5.csv"
+EDA_PAIRWISE_OUT = "eda_pairwise_differences_v12_5.csv"
+DISTORTION_SUMMARY_OUT = "distortion_summary_v12_5.csv"
+ISOLATED_RMSD_OUT = "isolated_fragment_rmsd_v12_5.csv"
+COMPARISON_REPORT_OUT = "comparison_report_v12_5.txt"
+DESCRIPTOR_CN_OUT = "descriptor_chinese_notes_v12_5.csv"
+PAIRWISE_DESCRIPTOR_OUT = "pairwise_descriptor_differences_v12_5.csv"
+BSA_ATOM_CONTRIB_OUT = "phenyl_ligand_BSA_atom_contributions_v12_5.csv"
+REPORT_TOP_ATOMS = 8
+REPORT_TOP_CONTACTS = 8
+
+# If |delta(prep_cat)| and |delta(prep_sub)| are numerically identical within
+# this tolerance, pairwise distortion-source classification is reported as equal.
+DISTORTION_EQUAL_TOL = 1.0e-8
+
+COV = {
+    "H": 0.31, "B": 0.84, "C": 0.76, "N": 0.71, "O": 0.66,
+    "F": 0.57, "Si": 1.11, "P": 1.07, "S": 1.05,
+    "Cl": 1.02, "Br": 1.20, "I": 1.39,
+}
+
+# Unscaled empirical vdW radii used only as a common geometric reference.
+VDW = {
+    "H": 1.20, "B": 1.92, "C": 1.70, "N": 1.55, "O": 1.52,
+    "F": 1.47, "Si": 2.10, "P": 1.80, "S": 1.80,
+    "Cl": 1.75, "Br": 1.85, "I": 1.98,
+}
+
+# ============================================================
+# BASIC XYZ / GEOMETRY
+# ============================================================
+
+def read_xyz(filename):
+    with open(filename, encoding="utf-8") as f:
+        lines = f.readlines()
+    nat = int(lines[0].strip())
+    atoms = []
+    for i, line in enumerate(lines[2:2 + nat], start=1):
+        p = line.split()
+        if len(p) < 4:
+            raise ValueError(f"Malformed XYZ line in {filename}: {line.rstrip()}")
+        atoms.append({
+            "index": i,
+            "element": p[0],
+            "x": float(p[1]),
+            "y": float(p[2]),
+            "z": float(p[3]),
+        })
+    return atoms
+
+
+def atom_dict(atoms):
+    return {a["index"]: a for a in atoms}
+
+
+def distance(a, b):
+    return math.sqrt(
+        (a["x"] - b["x"]) ** 2 +
+        (a["y"] - b["y"]) ** 2 +
+        (a["z"] - b["z"]) ** 2
+    )
+
+
+def bond_cutoff(e1, e2):
+    return BOND_SCALE * (COV[e1] + COV[e2])
+
+
+def vdw_gap(a, b):
+    """d - (r_vdW,a + r_vdW,b). Negative = geometric vdW overlap."""
+    return distance(a, b) - VDW[a["element"]] - VDW[b["element"]]
+
+
+def overlap_depth_from_gap(gap):
+    """Positive overlap depth in Å; 0 if gap >= 0."""
+    return max(0.0, -gap)
+
+
+# ----------------------------
+# vector / torsion helpers
+# ----------------------------
+
+def _vec(a, b):
+    return (b["x"] - a["x"], b["y"] - a["y"], b["z"] - a["z"])
+
+
+def _dot(u, v):
+    return u[0] * v[0] + u[1] * v[1] + u[2] * v[2]
+
+
+def _cross(u, v):
+    return (
+        u[1] * v[2] - u[2] * v[1],
+        u[2] * v[0] - u[0] * v[2],
+        u[0] * v[1] - u[1] * v[0],
+    )
+
+
+def _norm(v):
+    return math.sqrt(_dot(v, v))
+
+
+def _scale(v, s):
+    return (v[0] * s, v[1] * s, v[2] * s)
+
+
+def _sub(u, v):
+    return (u[0] - v[0], u[1] - v[1], u[2] - v[2])
+
+
+def dihedral_deg(a, b, c, d):
+    """Signed A-B-C-D dihedral in (-180, 180]."""
+    b0 = _vec(b, a)
+    b1 = _vec(b, c)
+    b2 = _vec(c, d)
+
+    n1 = _norm(b1)
+    if n1 < 1e-12:
+        return float("nan")
+    b1u = _scale(b1, 1.0 / n1)
+
+    v = _sub(b0, _scale(b1u, _dot(b0, b1u)))
+    w = _sub(b2, _scale(b1u, _dot(b2, b1u)))
+    if _norm(v) < 1e-12 or _norm(w) < 1e-12:
+        return float("nan")
+
+    x = _dot(v, w)
+    y = _dot(_cross(b1u, v), w)
+    phi = math.degrees(math.atan2(y, x))
+    if phi <= -180.0 + 1e-12:
+        phi = 180.0
+    return phi
+
+
+
+# ============================================================
+# V12: TRUE COORDINATE RMSD (PURE PYTHON) + PHENYL/LIGAND BURIED SASA
+# ============================================================
+
+def _centroid_points(points):
+    n = len(points)
+    if n == 0:
+        raise ValueError("Cannot compute centroid of zero points")
+    return (
+        sum(p[0] for p in points) / n,
+        sum(p[1] for p in points) / n,
+        sum(p[2] for p in points) / n,
+    )
+
+
+def _matvec3(m, v):
+    return (
+        m[0][0]*v[0] + m[0][1]*v[1] + m[0][2]*v[2],
+        m[1][0]*v[0] + m[1][1]*v[1] + m[1][2]*v[2],
+        m[2][0]*v[0] + m[2][1]*v[1] + m[2][2]*v[2],
+    )
+
+
+def _largest_eigenvector_symmetric_4x4(mat, niter=200, tol=1e-14):
+    """Power iteration for the largest eigenvector of a symmetric 4x4 matrix."""
+    q = [1.0, 0.0, 0.0, 0.0]
+    for _ in range(niter):
+        z = [sum(mat[i][j] * q[j] for j in range(4)) for i in range(4)]
+        norm = math.sqrt(sum(x*x for x in z))
+        if norm < 1e-30:
+            return (1.0, 0.0, 0.0, 0.0)
+        z = [x / norm for x in z]
+        # q and -q are the same quaternion, so compare both signs.
+        d1 = math.sqrt(sum((z[i] - q[i])**2 for i in range(4)))
+        d2 = math.sqrt(sum((z[i] + q[i])**2 for i in range(4)))
+        q = z
+        if min(d1, d2) < tol:
+            break
+    return tuple(q)
+
+
+def _quaternion_rotation_target_to_ref(ref_centered, target_centered):
+    """
+    Horn/Davenport optimal rotation mapping TARGET centered coordinates onto REF.
+    No numpy dependency is used.
+    """
+    # Cross-dispersion matrix M = sum(target * ref^T)
+    sxx = sxy = sxz = syx = syy = syz = szx = szy = szz = 0.0
+    for p, q in zip(ref_centered, target_centered):
+        # q = target, p = reference
+        sxx += q[0]*p[0]; sxy += q[0]*p[1]; sxz += q[0]*p[2]
+        syx += q[1]*p[0]; syy += q[1]*p[1]; syz += q[1]*p[2]
+        szx += q[2]*p[0]; szy += q[2]*p[1]; szz += q[2]*p[2]
+
+    tr = sxx + syy + szz
+    nmat = [
+        [tr,        syz-szy,   szx-sxz,   sxy-syx],
+        [syz-szy,   sxx-syy-szz, sxy+syx, szx+sxz],
+        [szx-sxz,   sxy+syx,  -sxx+syy-szz, syz+szy],
+        [sxy-syx,   szx+sxz,   syz+szy,  -sxx-syy+szz],
+    ]
+    w, x, y, z = _largest_eigenvector_symmetric_4x4(nmat)
+
+    # Quaternion -> rotation matrix.
+    return (
+        (1-2*(y*y+z*z), 2*(x*y-z*w),   2*(x*z+y*w)),
+        (2*(x*y+z*w),   1-2*(x*x+z*z), 2*(y*z-x*w)),
+        (2*(x*z-y*w),   2*(y*z+x*w),   1-2*(x*x+y*y)),
+    )
+
+
+def optimal_rigid_fit(ref_points, target_points):
+    """
+    Return (rotation, target_centroid, ref_centroid, rmsd) for the least-squares
+    rigid fit TARGET -> REF.  Atom correspondence must already be established.
+    """
+    if len(ref_points) != len(target_points) or not ref_points:
+        raise ValueError("RMSD point sets must be nonempty and have equal length")
+
+    cref = _centroid_points(ref_points)
+    ctar = _centroid_points(target_points)
+    pr = [_sub(p, cref) for p in ref_points]
+    pt = [_sub(p, ctar) for p in target_points]
+    rot = _quaternion_rotation_target_to_ref(pr, pt)
+
+    ss = 0.0
+    for p, q in zip(pr, pt):
+        qr = _matvec3(rot, q)
+        ss += (qr[0]-p[0])**2 + (qr[1]-p[1])**2 + (qr[2]-p[2])**2
+    rmsd = math.sqrt(ss / len(pr))
+    return rot, ctar, cref, rmsd
+
+
+def apply_rigid_fit_to_point(point, fit):
+    rot, ctar, cref, _ = fit
+    q = _sub(point, ctar)
+    qr = _matvec3(rot, q)
+    return (qr[0]+cref[0], qr[1]+cref[1], qr[2]+cref[2])
+
+
+def rmsd_without_refit(ref_points, target_points_transformed):
+    if len(ref_points) != len(target_points_transformed) or not ref_points:
+        return float("nan")
+    ss = 0.0
+    for p, q in zip(ref_points, target_points_transformed):
+        ss += (p[0]-q[0])**2 + (p[1]-q[1])**2 + (p[2]-q[2])**2
+    return math.sqrt(ss / len(ref_points))
+
+
+def fragment_rmsd_descriptors(ref_atoms, target_atoms, substrate_mapping,
+                              ligand_mapping, phenyl_ring_ref):
+    """
+    True coordinate RMSDs relative to REFERENCE.
+
+    Independent fragment RMSDs remove overall translation/rotation of each fragment.
+    The substrate/phenyl POSE RMSDs instead fit Fe+ligand heavy atoms first, then
+    measure the mapped substrate without a second fit.
+    """
+    rad = atom_dict(ref_atoms)
+    tad = atom_dict(target_atoms)
+
+    ref_lig_heavy = sorted(a["index"] for a in heavy_ligand(ref_atoms))
+    ref_cat_core_ids = [FE_INDEX] + ref_lig_heavy
+    tar_cat_core_ids = [FE_INDEX] + [ligand_mapping[i] for i in ref_lig_heavy]
+
+    ref_cat_core_pts = [atom_point(rad[i]) for i in ref_cat_core_ids]
+    tar_cat_core_pts = [atom_point(tad[i]) for i in tar_cat_core_ids]
+    cat_core_fit = optimal_rigid_fit(ref_cat_core_pts, tar_cat_core_pts)
+
+    # Include reactive O atoms as part of the catalyst fragment, using their fixed
+    # atom identities.  Keep the Fe+ligand-only RMSD as a separate diagnostic.
+    ref_cat_o_ids = ref_cat_core_ids + list(REACTIVE_O)
+    tar_cat_o_ids = tar_cat_core_ids + list(REACTIVE_O)
+    ref_cat_o_pts = [atom_point(rad[i]) for i in ref_cat_o_ids]
+    tar_cat_o_pts = [atom_point(tad[i]) for i in tar_cat_o_ids]
+    cat_o_fit = optimal_rigid_fit(ref_cat_o_pts, tar_cat_o_pts)
+
+    ref_sub_ids = sorted(substrate_mapping.keys())
+    tar_sub_ids = [substrate_mapping[i] for i in ref_sub_ids]
+    ref_sub_pts = [atom_point(rad[i]) for i in ref_sub_ids]
+    tar_sub_pts = [atom_point(tad[i]) for i in tar_sub_ids]
+    sub_fit = optimal_rigid_fit(ref_sub_pts, tar_sub_pts)
+
+    tar_sub_after_cat = [apply_rigid_fit_to_point(atom_point(tad[i]), cat_core_fit)
+                         for i in tar_sub_ids]
+    sub_pose_rmsd = rmsd_without_refit(ref_sub_pts, tar_sub_after_cat)
+
+    ref_ph_ids = list(phenyl_ring_ref)
+    tar_ph_ids = [substrate_mapping[i] for i in ref_ph_ids]
+    ref_ph_pts = [atom_point(rad[i]) for i in ref_ph_ids]
+    tar_ph_after_cat = [apply_rigid_fit_to_point(atom_point(tad[i]), cat_core_fit)
+                        for i in tar_ph_ids]
+    ph_pose_rmsd = rmsd_without_refit(ref_ph_pts, tar_ph_after_cat)
+
+    return {
+        "cat_FeLig_heavy_internal_RMSD_A": cat_core_fit[3],
+        "cat_FeLigO_heavy_internal_RMSD_A": cat_o_fit[3],
+        "substrate_heavy_internal_RMSD_A": sub_fit[3],
+        "substrate_heavy_pose_RMSD_after_FeLig_alignment_A": sub_pose_rmsd,
+        "phenyl_ring_pose_RMSD_after_FeLig_alignment_A": ph_pose_rmsd,
+    }
+
+
+
+def resolve_deformation_core_ref(ref_atoms):
+    """
+    Return reference atom indices used for catalyst-core alignment.
+
+    Default: Fe + four nearest ligand N atoms.  This is intentionally independent
+    of the generic covalent-radius graph, because Fe is not part of that graph.
+    """
+    ad = atom_dict(ref_atoms)
+    if DEFORMATION_CORE_REF is not None:
+        ids = list(DEFORMATION_CORE_REF)
+        missing = [i for i in ids if i not in ad]
+        if missing:
+            raise RuntimeError(f"DEFORMATION_CORE_REF contains missing atoms: {missing}")
+        if FE_INDEX not in ids:
+            raise RuntimeError("DEFORMATION_CORE_REF must include FE_INDEX")
+        return ids, "manual"
+
+    fe = ad[FE_INDEX]
+    ligand_n = [
+        a for a in ref_atoms
+        if LIG_START <= a["index"] <= LIG_END and a["element"] == "N"
+    ]
+    if len(ligand_n) < 4:
+        raise RuntimeError(
+            f"Auto Fe+N4 core detection found only {len(ligand_n)} ligand N atoms"
+        )
+    ligand_n.sort(key=lambda a: distance(fe, a))
+    chosen = ligand_n[:4]
+    return [FE_INDEX] + [a["index"] for a in chosen], "auto_Fe_plus_4_nearest_ligand_N"
+
+
+def _rank_desc(values):
+    """1-based descending ranks; ties are left in deterministic atom order."""
+    order = sorted(range(len(values)), key=lambda i: (-values[i], i))
+    ranks = [0] * len(values)
+    for rank, i in enumerate(order, start=1):
+        ranks[i] = rank
+    return ranks
+
+
+def _displacement_rows_for_fit(ref_atoms, target_atoms, ref_ids, tar_ids, fit):
+    """Return per-atom displacements after applying one precomputed rigid fit."""
+    rad = atom_dict(ref_atoms)
+    tad = atom_dict(target_atoms)
+    rows = []
+    for ri, ti in zip(ref_ids, tar_ids):
+        rp = atom_point(rad[ri])
+        tp = apply_rigid_fit_to_point(atom_point(tad[ti]), fit)
+        d = point_distance(rp, tp)
+        rows.append((ri, ti, rad[ri]["element"], d))
+    return rows
+
+
+def _build_generic_heavy_graph(atoms):
+    """Build a covalent graph for all non-H atoms in an arbitrary standalone fragment."""
+    heavy = [a for a in atoms if a["element"] != "H"]
+    graph = {a["index"]: set() for a in heavy}
+    adict = {a["index"]: a for a in heavy}
+    for i in range(len(heavy)):
+        for j in range(i + 1, len(heavy)):
+            a, b = heavy[i], heavy[j]
+            if a["element"] not in COV or b["element"] not in COV:
+                raise RuntimeError(
+                    f"Cannot infer standalone-fragment connectivity for element pair "
+                    f"{a['element']}/{b['element']}; add covalent radii to COV if needed."
+                )
+            if distance(a, b) <= bond_cutoff(a["element"], b["element"]):
+                graph[a["index"]].add(b["index"])
+                graph[b["index"]].add(a["index"])
+    return graph, adict
+
+
+def _best_isolated_substrate_mapping(sub_ref_atoms, mapping_ref_atoms):
+    """
+    Map heavy atoms of an arbitrarily ordered isolated substrate XYZ onto the
+    substrate heavy atoms of the mapping-reference TS.
+
+    Connectivity + element signatures generate chemically valid graph maps.
+    If symmetry gives several maps, choose the one with the smallest Kabsch RMSD
+    between isolated-substrate and mapping-reference substrate heavy atoms.
+
+    Returns
+    -------
+    local_sub_to_mapref : dict
+        isolated-substrate local atom index -> mapping-reference TS atom index
+        for HEAVY atoms only.
+    best_rmsd : float
+    n_mappings : int
+    """
+    ref_sub_heavy = [a for a in substrate_atoms(mapping_ref_atoms) if a["element"] != "H"]
+    if len([a for a in sub_ref_atoms if a["element"] != "H"]) != len(ref_sub_heavy):
+        raise RuntimeError(
+            f"Substrate reference {SUB_REFERENCE_XYZ!r} has "
+            f"{len([a for a in sub_ref_atoms if a['element'] != 'H'])} heavy atoms; "
+            f"mapping-reference TS has {len(ref_sub_heavy)} substrate heavy atoms."
+        )
+
+    sg, sa = _build_generic_heavy_graph(sub_ref_atoms)
+
+    # Build the same kind of graph, but only on the mapping-reference substrate heavy atoms.
+    tg = {a["index"]: set() for a in ref_sub_heavy}
+    ta = {a["index"]: a for a in ref_sub_heavy}
+    for i in range(len(ref_sub_heavy)):
+        for j in range(i + 1, len(ref_sub_heavy)):
+            a, b = ref_sub_heavy[i], ref_sub_heavy[j]
+            if distance(a, b) <= bond_cutoff(a["element"], b["element"]):
+                tg[a["index"]].add(b["index"])
+                tg[b["index"]].add(a["index"])
+
+    maps = find_mappings(sg, sa, tg, ta)
+    if not maps:
+        raise RuntimeError(
+            "Could not graph-map the isolated substrate onto the mapping-reference TS. "
+            "Check that sub.xyz has the same molecular connectivity/protonation as the TS substrate."
+        )
+
+    best = None
+    for m in maps:
+        local_ids = sorted(m)
+        tar_ids = [m[i] for i in local_ids]
+        fit = optimal_rigid_fit(
+            [atom_point(sa[i]) for i in local_ids],
+            [atom_point(ta[j]) for j in tar_ids],
+        )
+        score = fit[3]
+        # deterministic tie-break by mapped atom tuple
+        key = (score, tuple(tar_ids))
+        if best is None or key < best[0]:
+            best = (key, dict(m))
+
+    return best[1], best[0][0], len(maps)
+
+
+def _write_isolated_substrate_mapping(local_sub_to_mapref, sub_ref_atoms, mapping_ref_atoms,
+                                       best_rmsd, n_mappings):
+    sad = atom_dict(sub_ref_atoms)
+    rad = atom_dict(mapping_ref_atoms)
+    fields = [
+        "isolated_sub_atom", "isolated_sub_element",
+        "mapping_reference_TS_atom", "mapping_reference_TS_element",
+        "selected_mapping_Kabsch_RMSD_A", "n_valid_graph_mappings",
+    ]
+    with open("isolated_substrate_mapping_v12_5.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for local_i in sorted(local_sub_to_mapref):
+            ref_i = local_sub_to_mapref[local_i]
+            w.writerow({
+                "isolated_sub_atom": local_i,
+                "isolated_sub_element": sad[local_i]["element"],
+                "mapping_reference_TS_atom": ref_i,
+                "mapping_reference_TS_element": rad[ref_i]["element"],
+                "selected_mapping_Kabsch_RMSD_A": fmt(best_rmsd),
+                "n_valid_graph_mappings": n_mappings,
+            })
+
+
+def _validate_isolated_fragment_order(cat_ref_atoms, sub_ref_atoms, mapping_ref_atoms):
+    """
+    Validate isolated references.
+
+    Catalyst: still requires the same atom order as TS atoms 1..SUB_START-1,
+              because Fe/ligand/reactive-O correspondence is chemically specific.
+    Substrate: atom order is NOT required to match.  V12.5 graph-maps the
+               isolated substrate heavy atoms automatically.
+    """
+    expected_cat_n = SUB_START - 1
+    if len(cat_ref_atoms) != expected_cat_n:
+        raise RuntimeError(
+            f"Catalyst reference {CAT_REFERENCE_XYZ!r} has {len(cat_ref_atoms)} atoms; "
+            f"expected exactly {expected_cat_n} atoms (TS atoms 1..{expected_cat_n})."
+        )
+
+    rad = atom_dict(mapping_ref_atoms)
+    cad = atom_dict(cat_ref_atoms)
+    for i in range(1, expected_cat_n + 1):
+        if cad[i]["element"] != rad[i]["element"]:
+            raise RuntimeError(
+                f"Catalyst reference atom-order mismatch at local atom {i}: "
+                f"cat ref has {cad[i]['element']}, mapping reference TS has {rad[i]['element']}. "
+                "For V12.5, cat.xyz still needs the same atom order as the catalyst fragment "
+                "in the reordered TS files.  sub.xyz no longer has this restriction."
+            )
+
+    ref_sub = substrate_atoms(mapping_ref_atoms)
+    if len(sub_ref_atoms) != len(ref_sub):
+        raise RuntimeError(
+            f"Substrate reference {SUB_REFERENCE_XYZ!r} has {len(sub_ref_atoms)} total atoms; "
+            f"mapping-reference TS has {len(ref_sub)} substrate atoms. "
+            "Atom ORDER may differ, but the molecular composition must match."
+        )
+
+    ref_counts = {}
+    sub_counts = {}
+    for a in ref_sub:
+        ref_counts[a["element"]] = ref_counts.get(a["element"], 0) + 1
+    for a in sub_ref_atoms:
+        sub_counts[a["element"]] = sub_counts.get(a["element"], 0) + 1
+    if ref_counts != sub_counts:
+        raise RuntimeError(
+            f"Substrate elemental composition mismatch: isolated sub {sub_counts}, "
+            f"mapping-reference TS substrate {ref_counts}."
+        )
+
+
+def _target_cat_index_from_ref_index(ref_idx, ligand_mapping):
+    if ref_idx == FE_INDEX or ref_idx in REACTIVE_O:
+        return ref_idx
+    if LIG_START <= ref_idx <= LIG_END:
+        return ligand_mapping[ref_idx]
+    raise RuntimeError(f"Unsupported catalyst reference atom index {ref_idx}")
+
+
+def isolated_fragment_deformation(structures, substrate_mappings, ligand_mappings,
+                                  mapping_ref_atoms, cat_ref_atoms, sub_ref_atoms):
+    """
+    Compare every selected TS independently against isolated caT.XYZ / sub.xyz.
+
+    This is the atom-resolved analysis intended to accompany preparation energies.
+    NO TS is used as the deformation reference.
+
+    Catalyst:
+      * heavy-atom best-fit RMSD vs isolated catalyst
+      * per-atom d^2 contribution to that RMSD^2
+      * per-atom displacement after isolated-catalyst Fe+N4 core alignment
+
+    Substrate:
+      * heavy-atom best-fit RMSD vs isolated substrate
+      * per-atom d^2 contribution to that RMSD^2
+
+    Returns
+    -------
+    metrics_by_structure, core_ref_ids, core_mode
+    """
+    _validate_isolated_fragment_order(cat_ref_atoms, sub_ref_atoms, mapping_ref_atoms)
+
+    cad = atom_dict(cat_ref_atoms)
+    sad = atom_dict(sub_ref_atoms)
+    maprad = atom_dict(mapping_ref_atoms)
+
+    # Heavy atoms of the isolated catalyst correspond to the same local indices
+    # as atoms 1..64 in the mapping-reference TS.
+    cat_heavy_ref_ids = [a["index"] for a in cat_ref_atoms if a["element"] != "H"]
+    core_ref_ids, core_mode = resolve_deformation_core_ref(cat_ref_atoms)
+    core_set = set(core_ref_ids)
+
+    # V12.5: isolated substrate atom order may be arbitrary.
+    # Establish heavy-atom correspondence by graph mapping, then use the existing
+    # mapping-reference -> target-TS substrate maps for every selected structure.
+    local_sub_to_mapref, isolated_sub_map_rmsd, isolated_sub_nmaps = \
+        _best_isolated_substrate_mapping(sub_ref_atoms, mapping_ref_atoms)
+    _write_isolated_substrate_mapping(
+        local_sub_to_mapref, sub_ref_atoms, mapping_ref_atoms,
+        isolated_sub_map_rmsd, isolated_sub_nmaps,
+    )
+    sub_heavy_local_ids = sorted(local_sub_to_mapref)
+
+    cat_rows_all = []
+    sub_rows_all = []
+    metrics = {}
+
+    for name, atoms in structures.items():
+        tad = atom_dict(atoms)
+        ligmap = ligand_mappings[name]
+        submap = substrate_mappings[name]
+
+        # ---------------- catalyst vs isolated cat ----------------
+        cat_tar_ids = [
+            _target_cat_index_from_ref_index(i, ligmap) for i in cat_heavy_ref_ids
+        ]
+        # Validate element identity after mapping.
+        for ri, ti in zip(cat_heavy_ref_ids, cat_tar_ids):
+            if cad[ri]["element"] != tad[ti]["element"]:
+                raise RuntimeError(
+                    f"{name}: catalyst mapping element mismatch cat-ref {cad[ri]['element']}{ri} "
+                    f"-> TS {tad[ti]['element']}{ti}"
+                )
+
+        cat_fit = optimal_rigid_fit(
+            [atom_point(cad[i]) for i in cat_heavy_ref_ids],
+            [atom_point(tad[i]) for i in cat_tar_ids],
+        )
+        cat_disp = _displacement_rows_for_fit(
+            cat_ref_atoms, atoms, cat_heavy_ref_ids, cat_tar_ids, cat_fit
+        )
+        cat_d2 = [x[3] ** 2 for x in cat_disp]
+        cat_sumd2 = sum(cat_d2)
+        cat_ranks = _rank_desc([x[3] for x in cat_disp])
+
+        core_tar_ids = [
+            _target_cat_index_from_ref_index(i, ligmap) for i in core_ref_ids
+        ]
+        core_fit = optimal_rigid_fit(
+            [atom_point(cad[i]) for i in core_ref_ids],
+            [atom_point(tad[i]) for i in core_tar_ids],
+        )
+        cat_core_disp = _displacement_rows_for_fit(
+            cat_ref_atoms, atoms, cat_heavy_ref_ids, cat_tar_ids, core_fit
+        )
+        core_ranks = _rank_desc([x[3] for x in cat_core_disp])
+
+        for j, ((ri, ti, el, dall), (_, _, _, dcore)) in enumerate(
+            zip(cat_disp, cat_core_disp)
+        ):
+            if ri == FE_INDEX:
+                region = "Fe"
+            elif ri in REACTIVE_O:
+                region = "reactive_O"
+            else:
+                region = "ligand_heavy"
+            cat_rows_all.append({
+                "structure": name,
+                "mechanism": mechanism_label(name),
+                "stereo": stereo_label(name),
+                "isolated_reference": CAT_REFERENCE_XYZ,
+                "reference_atom": ri,
+                "mapped_TS_atom": ti,
+                "element": el,
+                "region": region,
+                "is_FeN4_alignment_core": int(ri in core_set),
+                "FeN4_core_mode": core_mode,
+                "FeN4_core_reference_atoms": ";".join(map(str, core_ref_ids)),
+                "displacement_after_isolated_cat_allheavy_fit_A": dall,
+                "contribution_to_isolated_cat_RMSD2_pct": (
+                    100.0 * cat_d2[j] / cat_sumd2 if cat_sumd2 > 1e-30 else 0.0
+                ),
+                "rank_by_isolated_cat_allheavy_displacement": cat_ranks[j],
+                "displacement_after_isolated_cat_FeN4_core_fit_A": dcore,
+                "rank_by_isolated_cat_FeN4_core_displacement": core_ranks[j],
+            })
+
+        # ---------------- substrate vs isolated sub ----------------
+        sub_tar_ids = []
+        for local_i in sub_heavy_local_ids:
+            map_ref_idx = local_sub_to_mapref[local_i]
+            if map_ref_idx not in submap:
+                raise RuntimeError(
+                    f"{name}: mapping-reference substrate atom {map_ref_idx} missing from substrate mapping"
+                )
+            sub_tar_ids.append(submap[map_ref_idx])
+        for ri, ti in zip(sub_heavy_local_ids, sub_tar_ids):
+            if sad[ri]["element"] != tad[ti]["element"]:
+                raise RuntimeError(
+                    f"{name}: substrate mapping element mismatch sub-ref {sad[ri]['element']}{ri} "
+                    f"-> TS {tad[ti]['element']}{ti}"
+                )
+
+        sub_fit = optimal_rigid_fit(
+            [atom_point(sad[i]) for i in sub_heavy_local_ids],
+            [atom_point(tad[i]) for i in sub_tar_ids],
+        )
+        sub_disp = _displacement_rows_for_fit(
+            sub_ref_atoms, atoms, sub_heavy_local_ids, sub_tar_ids, sub_fit
+        )
+        sub_d2 = [x[3] ** 2 for x in sub_disp]
+        sub_sumd2 = sum(sub_d2)
+        sub_ranks = _rank_desc([x[3] for x in sub_disp])
+
+        for j, (ri, ti, el, dint) in enumerate(sub_disp):
+            sub_rows_all.append({
+                "structure": name,
+                "mechanism": mechanism_label(name),
+                "stereo": stereo_label(name),
+                "isolated_reference": SUB_REFERENCE_XYZ,
+                "reference_atom": ri,
+                "mapping_reference_TS_atom": local_sub_to_mapref[ri],
+                "mapped_TS_atom": ti,
+                "element": el,
+                "internal_displacement_vs_isolated_sub_A": dint,
+                "contribution_to_isolated_sub_RMSD2_pct": (
+                    100.0 * sub_d2[j] / sub_sumd2 if sub_sumd2 > 1e-30 else 0.0
+                ),
+                "rank_by_isolated_sub_displacement": sub_ranks[j],
+            })
+
+        metrics[name] = {
+            "cat_isolated_ref_heavy_RMSD_A": cat_fit[3],
+            "sub_isolated_ref_heavy_RMSD_A": sub_fit[3],
+            "cat_isolated_ref_FeN4_core_fit_RMSD_A": core_fit[3],
+            "isolated_sub_to_mapping_ref_Kabsch_RMSD_A": isolated_sub_map_rmsd,
+            "isolated_sub_n_valid_graph_mappings": isolated_sub_nmaps,
+        }
+
+    def write_rows(path, rows):
+        fields = []
+        seen = set()
+        for row in rows:
+            for k in row:
+                if k not in seen:
+                    seen.add(k)
+                    fields.append(k)
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=fields)
+            w.writeheader()
+            for row in rows:
+                w.writerow({k: fmt(row.get(k, "")) for k in fields})
+
+    write_rows(CAT_ATOM_DISP_OUT, cat_rows_all)
+    write_rows(SUB_ATOM_DISP_OUT, sub_rows_all)
+    return metrics, core_ref_ids, core_mode
+
+
+def _fibonacci_sphere_points(n):
+    """Approximately uniform unit-sphere points, deterministic."""
+    pts = []
+    golden = math.pi * (3.0 - math.sqrt(5.0))
+    for i in range(n):
+        y = 1.0 - 2.0 * (i + 0.5) / n
+        r = math.sqrt(max(0.0, 1.0 - y*y))
+        phi = golden * i
+        pts.append((math.cos(phi)*r, y, math.sin(phi)*r))
+    return pts
+
+
+_SASA_UNIT_POINTS = None
+
+
+def _sasa_unit_points():
+    global _SASA_UNIT_POINTS
+    if _SASA_UNIT_POINTS is None or len(_SASA_UNIT_POINTS) != SASA_N_POINTS:
+        _SASA_UNIT_POINTS = _fibonacci_sphere_points(SASA_N_POINTS)
+    return _SASA_UNIT_POINTS
+
+
+def sasa_of_group(atoms, group_indices, environment_indices):
+    """
+    Approximate SASA (A^2) of group_indices in the specified environment.
+    Radii = empirical vdW radius + SASA_PROBE_A.
+    """
+    ad = atom_dict(atoms)
+    group_indices = list(dict.fromkeys(group_indices))
+    environment_indices = list(dict.fromkeys(environment_indices))
+    unit_pts = _sasa_unit_points()
+    total = 0.0
+
+    for i in group_indices:
+        ai = ad[i]
+        ri = VDW[ai["element"]] + SASA_PROBE_A
+        # Only atoms whose expanded spheres can geometrically occlude this atom.
+        occluders = []
+        for j in environment_indices:
+            if j == i:
+                continue
+            aj = ad[j]
+            rj = VDW[aj["element"]] + SASA_PROBE_A
+            dij = distance(ai, aj)
+            if dij < ri + rj:
+                occluders.append((aj, rj*rj))
+
+        accessible = 0
+        for u in unit_pts:
+            p = (ai["x"] + ri*u[0], ai["y"] + ri*u[1], ai["z"] + ri*u[2])
+            blocked = False
+            for aj, rj2 in occluders:
+                dx = p[0] - aj["x"]
+                dy = p[1] - aj["y"]
+                dz = p[2] - aj["z"]
+                if dx*dx + dy*dy + dz*dz < rj2:
+                    blocked = True
+                    break
+            if not blocked:
+                accessible += 1
+        total += (accessible / SASA_N_POINTS) * (4.0 * math.pi * ri * ri)
+    return total
+
+
+def phenyl_group_indices_with_H(atoms, phenyl_ring_indices):
+    ids = list(phenyl_ring_indices)
+    if PHENYL_CONTACT_INCLUDE_ATTACHED_H:
+        hparents = assign_hydrogens(atoms)
+        for ci in phenyl_ring_indices:
+            ids.extend(hparents.get(ci, []))
+    return sorted(set(ids))
+
+
+def phenyl_ligand_contact_area_descriptors(atoms, phenyl_ring_indices):
+    """
+    Buried SASA between the substrate phenyl group and ligand atoms 2-62 only.
+    Other substrate atoms, Fe, and reactive O atoms are intentionally excluded from
+    the mutual-interface calculation.
+
+    BSA_total = buried area on phenyl side + buried area on ligand side.
+    interface_area_halfBSA = 0.5 * BSA_total (common single-interface convention).
+    """
+    phenyl_ids = phenyl_group_indices_with_H(atoms, phenyl_ring_indices)
+    lig_ids = [a["index"] for a in ligand_atoms(atoms)]
+    combined = phenyl_ids + lig_ids
+
+    sasa_ph_alone = sasa_of_group(atoms, phenyl_ids, phenyl_ids)
+    sasa_ph_with_lig = sasa_of_group(atoms, phenyl_ids, combined)
+    sasa_lig_alone = sasa_of_group(atoms, lig_ids, lig_ids)
+    sasa_lig_with_ph = sasa_of_group(atoms, lig_ids, combined)
+
+    buried_ph = max(0.0, sasa_ph_alone - sasa_ph_with_lig)
+    buried_lig = max(0.0, sasa_lig_alone - sasa_lig_with_ph)
+    bsa_total = buried_ph + buried_lig
+
+    # Existing contact machinery, restricted to phenyl-group atoms vs ligand.
+    contacts = build_contact_list(atoms, phenyl_ids, ligand_atoms(atoms))
+    cs = summarize_contacts(contacts)
+
+    return {
+        "phenyl_contact_group_atoms": ";".join(map(str, phenyl_ids)),
+        "phenyl_contact_group_n_atoms": len(phenyl_ids),
+        "phenyl_ligand_min_distance_A": cs["min_distance_A"],
+        "phenyl_ligand_min_vdw_gap_A": cs["min_vdw_gap_A"],
+        "phenyl_ligand_vdw_overlap_sum_A": cs["vdw_overlap_sum_A"],
+        "phenyl_ligand_phenyl_buried_SASA_A2": buried_ph,
+        "phenyl_ligand_ligand_buried_SASA_A2": buried_lig,
+        "phenyl_ligand_BSA_total_A2": bsa_total,
+        "phenyl_ligand_interface_area_halfBSA_A2": 0.5 * bsa_total,
+    }
+
+# ============================================================
+# SUBSTRATE GRAPH MAPPING
+# ============================================================
+
+def substrate_atoms(atoms):
+    return [a for a in atoms if a["index"] >= SUB_START]
+
+
+def heavy_substrate(atoms):
+    return [a for a in substrate_atoms(atoms) if a["element"] != "H"]
+
+
+def build_graph(atoms):
+    heavy = heavy_substrate(atoms)
+    graph = {a["index"]: set() for a in heavy}
+    adict = {a["index"]: a for a in heavy}
+
+    for i in range(len(heavy)):
+        for j in range(i + 1, len(heavy)):
+            a, b = heavy[i], heavy[j]
+            if distance(a, b) <= bond_cutoff(a["element"], b["element"]):
+                graph[a["index"]].add(b["index"])
+                graph[b["index"]].add(a["index"])
+    return graph, adict
+
+
+def signature(idx, graph, atoms):
+    neigh_elements = sorted(atoms[n]["element"] for n in graph[idx])
+    return (atoms[idx]["element"], len(graph[idx]), tuple(neigh_elements))
+
+
+def find_mappings(ref_graph, ref_atoms, target_graph, target_atoms):
+    candidates = {}
+    for r in ref_graph:
+        sr = signature(r, ref_graph, ref_atoms)
+        candidates[r] = [
+            t for t in target_graph
+            if signature(t, target_graph, target_atoms) == sr
+        ]
+        if not candidates[r]:
+            return []
+
+    order = sorted(ref_graph, key=lambda r: (len(candidates[r]), -len(ref_graph[r])))
+    solutions = []
+
+    def backtrack(pos, mapping, used):
+        if len(solutions) >= MAX_MAPPINGS:
+            return
+        if pos == len(order):
+            solutions.append(mapping.copy())
+            return
+
+        r = order[pos]
+        for t in candidates[r]:
+            if t in used:
+                continue
+            ok = True
+            for r2, t2 in mapping.items():
+                if ((r2 in ref_graph[r]) != (t2 in target_graph[t])):
+                    ok = False
+                    break
+            if not ok:
+                continue
+            mapping[r] = t
+            used.add(t)
+            backtrack(pos + 1, mapping, used)
+            used.remove(t)
+            del mapping[r]
+
+    backtrack(0, {}, set())
+    return solutions
+
+
+def distance_matrix_rms(mapping, ref_atoms, target_atoms):
+    """
+    RMS difference between all mapped heavy-atom internal pair distances.
+    This is NOT a coordinate/Kabsch RMSD.
+    """
+    indices = sorted(mapping)
+    ss = 0.0
+    n = 0
+    for i in range(len(indices)):
+        for j in range(i + 1, len(indices)):
+            ri, rj = indices[i], indices[j]
+            ti, tj = mapping[ri], mapping[rj]
+            dr = distance(ref_atoms[ri], ref_atoms[rj])
+            dt = distance(target_atoms[ti], target_atoms[tj])
+            ss += (dr - dt) ** 2
+            n += 1
+    return math.sqrt(ss / n) if n else 0.0
+
+
+def best_mapping(ref_atoms_all, target_atoms_all):
+    rg, ra = build_graph(ref_atoms_all)
+    tg, ta = build_graph(target_atoms_all)
+    mappings = find_mappings(rg, ra, tg, ta)
+    if not mappings:
+        raise RuntimeError("No substrate graph mapping found")
+    scored = [(distance_matrix_rms(m, ra, ta), m) for m in mappings]
+    scored.sort(key=lambda x: x[0])
+    return scored[0][1], scored[0][0], len(mappings)
+
+
+def symmetry_groups(ref_atoms_all):
+    graph, atoms = build_graph(ref_atoms_all)
+    autos = find_mappings(graph, atoms, graph, atoms)
+    parent = {i: i for i in graph}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for m in autos:
+        for i, j in m.items():
+            union(i, j)
+
+    groups = {}
+    for i in graph:
+        groups.setdefault(find(i), []).append(i)
+    groups = [sorted(v) for v in groups.values()]
+    groups.sort(key=lambda g: min(g))
+    return groups, len(autos)
+
+
+def assign_hydrogens(atoms):
+    subs = substrate_atoms(atoms)
+    heavy = [a for a in subs if a["element"] != "H"]
+    hydrogens = [a for a in subs if a["element"] == "H"]
+    result = {a["index"]: [] for a in heavy}
+
+    for h in hydrogens:
+        candidates = []
+        for hv in heavy:
+            d = distance(h, hv)
+            if d <= bond_cutoff("H", hv["element"]):
+                candidates.append((d, hv["index"]))
+        if candidates:
+            candidates.sort()
+            result[candidates[0][1]].append(h["index"])
+    return result
+
+
+# ============================================================
+# CONTACT ANALYSIS -- GEOMETRIC ONLY
+# ============================================================
+
+def ligand_atoms(atoms):
+    # All ligand atoms, including ligand H atoms.
+    return [a for a in atoms if LIG_START <= a["index"] <= LIG_END]
+
+
+def reactive_oxygen_atoms(atoms):
+    ad = atom_dict(atoms)
+    return [ad[i] for i in REACTIVE_O]
+
+
+def build_contact_list(atoms, substrate_indices, partner_atoms, skip_pairs=None):
+    """
+    Build raw geometric contacts.
+
+    skip_pairs: exact (substrate_index, partner_index) pairs to omit.
+    No energetic sign is assigned here.
+    """
+    if skip_pairs is None:
+        skip_pairs = set()
+
+    ad = atom_dict(atoms)
+    contacts = []
+    for si in substrate_indices:
+        s = ad[si]
+        for p in partner_atoms:
+            if (si, p["index"]) in skip_pairs:
+                continue
+            d = distance(s, p)
+            g = d - VDW[s["element"]] - VDW[p["element"]]
+            contacts.append({
+                "sub_idx": si,
+                "sub_element": s["element"],
+                "partner_idx": p["index"],
+                "partner_element": p["element"],
+                "distance_A": d,
+                "vdw_gap_A": g,
+                "vdw_overlap_depth_A": overlap_depth_from_gap(g),
+                "is_vdw_overlap": int(g < 0.0),
+                "is_proximity": int(g <= PROXIMITY_GAP_A),
+            })
+
+    contacts.sort(key=lambda x: x["vdw_gap_A"])
+    return contacts
+
+
+def summarize_contacts(contacts):
+    if not contacts:
+        return {
+            "min_distance_A": float("nan"),
+            "min_vdw_gap_A": float("nan"),
+            "vdw_overlap_sum_A": 0.0,
+            "n_vdw_overlap": 0,
+            "n_proximity": 0,
+            "n_pairs": 0,
+        }
+
+    return {
+        "min_distance_A": min(c["distance_A"] for c in contacts),
+        "min_vdw_gap_A": min(c["vdw_gap_A"] for c in contacts),
+        "vdw_overlap_sum_A": sum(c["vdw_overlap_depth_A"] for c in contacts),
+        "n_vdw_overlap": sum(c["is_vdw_overlap"] for c in contacts),
+        "n_proximity": sum(c["is_proximity"] for c in contacts),
+        "n_pairs": len(contacts),
+    }
+
+
+def contacts_for_sub_element(contacts, element):
+    return [c for c in contacts if c["sub_element"] == element]
+
+
+def contacts_for_other_elements(contacts, named=("H", "C", "N")):
+    return [c for c in contacts if c["sub_element"] not in named]
+
+
+def top_contacts_string(contacts, n=TOP_N):
+    out = []
+    for c in contacts[:n]:
+        out.append(
+            "%s%d-%s%d:g=%+.3f,d=%.3f" % (
+                c["sub_element"], c["sub_idx"],
+                c["partner_element"], c["partner_idx"],
+                c["vdw_gap_A"], c["distance_A"]
+            )
+        )
+    return "; ".join(out)
+
+
+# ============================================================
+# SUBSTRATE PHENYL-RING REFERENCE
+# ============================================================
+
+def _canonical_cycle(cycle):
+    """Canonical tuple for one ordered simple cycle, invariant to rotation/reversal."""
+    cyc = list(cycle)
+    n = len(cyc)
+    variants = []
+    for arr in (cyc, list(reversed(cyc))):
+        for k in range(n):
+            variants.append(tuple(arr[k:] + arr[:k]))
+    return min(variants)
+
+
+def find_six_carbon_cycles(atoms):
+    """
+    Find ordered simple six-member cycles made only of substrate carbon atoms.
+    This is a connectivity detector, not an aromaticity calculation.
+    """
+    graph, ad = build_graph(atoms)
+    cycles = set()
+
+    carbon_nodes = [i for i in graph if ad[i]["element"] == "C"]
+
+    def dfs(start, current, path):
+        if len(path) == 6:
+            if start in graph[current]:
+                cycles.add(_canonical_cycle(path))
+            return
+        for nb in graph[current]:
+            if ad[nb]["element"] != "C":
+                continue
+            if nb == start or nb in path:
+                continue
+            dfs(start, nb, path + [nb])
+
+    for start in carbon_nodes:
+        dfs(start, start, [start])
+
+    return sorted(cycles)
+
+
+def shortest_graph_distance(graph, starts, targets):
+    """Minimum number of bonds between any start and any target."""
+    starts = set(starts)
+    targets = set(targets)
+    if starts & targets:
+        return 0
+    frontier = list(starts)
+    seen = set(starts)
+    dist = 0
+    while frontier:
+        dist += 1
+        nxt = []
+        for node in frontier:
+            for nb in graph[node]:
+                if nb in seen:
+                    continue
+                if nb in targets:
+                    return dist
+                seen.add(nb)
+                nxt.append(nb)
+        frontier = nxt
+    return 10**9
+
+
+def resolve_phenyl_ring_ref(ref_atoms, forming_c_ref):
+    """
+    Resolve the phenyl-ring carbon indices in REFERENCE numbering.
+    Manual PHENYL_RING_REF wins.  Auto mode finds six-member all-carbon cycles
+    and, if there is more than one, chooses the cycle with the smallest graph
+    distance to the forming alkene carbons.
+    """
+    ad = atom_dict(ref_atoms)
+    graph, _ = build_graph(ref_atoms)
+
+    if PHENYL_RING_REF is not None:
+        raw_ring = tuple(PHENYL_RING_REF)
+        if len(raw_ring) != 6 or len(set(raw_ring)) != 6:
+            raise RuntimeError("PHENYL_RING_REF must contain six unique atom indices")
+        for i in raw_ring:
+            if i not in ad or ad[i]["element"] != "C" or i < SUB_START:
+                raise RuntimeError(f"PHENYL_RING_REF contains a missing/non-substrate/non-carbon atom: {i}")
+
+        # Accept the six ring atoms in ANY order.  Build the induced subgraph and
+        # reorder them into cyclic bonded order automatically.
+        ring_set = set(raw_ring)
+        local_neigh = {i: sorted(nb for nb in graph[i] if nb in ring_set) for i in raw_ring}
+        bad = {i: nbs for i, nbs in local_neigh.items() if len(nbs) != 2}
+        if bad:
+            details = "; ".join(f"C{i}: {','.join('C'+str(x) for x in nbs) or 'none'}"
+                                for i, nbs in sorted(bad.items()))
+            raise RuntimeError(
+                "The six atoms in PHENYL_RING_REF do not form one simple six-member carbon ring. "
+                "Within the selected set, every ring carbon must have exactly two ring neighbors. "
+                f"Problematic connectivity: {details}"
+            )
+
+        start = min(raw_ring)
+        first = local_neigh[start][0]
+        ordered = [start, first]
+        prev, cur = start, first
+        while len(ordered) < 6:
+            choices = [x for x in local_neigh[cur] if x != prev]
+            if len(choices) != 1:
+                raise RuntimeError("Could not uniquely order PHENYL_RING_REF into a six-member cycle")
+            nxt = choices[0]
+            if nxt in ordered:
+                raise RuntimeError("PHENYL_RING_REF closes a cycle before all six atoms are visited")
+            ordered.append(nxt)
+            prev, cur = cur, nxt
+        if start not in local_neigh[ordered[-1]]:
+            raise RuntimeError("PHENYL_RING_REF does not close into a six-member cycle")
+
+        ring = tuple(ordered)
+        return ring, [ring], "manual_autoordered"
+
+    candidates = find_six_carbon_cycles(ref_atoms)
+    if not candidates:
+        raise RuntimeError(
+            "No six-member all-carbon substrate ring was auto-detected. "
+            "Set PHENYL_RING_REF manually."
+        )
+
+    if len(candidates) == 1:
+        return candidates[0], candidates, "auto_unique"
+
+    scored = []
+    for ring in candidates:
+        d = shortest_graph_distance(graph, forming_c_ref, ring)
+        scored.append((d, ring))
+    scored.sort(key=lambda x: (x[0], x[1]))
+    return scored[0][1], candidates, "auto_nearest_to_forming_C"
+
+
+def mapped_ring_indices(mapping, ring_ref):
+    return [mapping[i] for i in ring_ref]
+
+
+def ring_centroid_and_normal(atoms, ordered_ring_indices):
+    """
+    Return centroid and a unit normal for an ordered six-member ring.
+    The normal sign is arbitrary; absolute plane distances/angles are used.
+    """
+    ad = atom_dict(atoms)
+    pts = [atom_point(ad[i]) for i in ordered_ring_indices]
+    cen = (
+        sum(p[0] for p in pts) / len(pts),
+        sum(p[1] for p in pts) / len(pts),
+        sum(p[2] for p in pts) / len(pts),
+    )
+    nvec = (0.0, 0.0, 0.0)
+    for i in range(len(pts)):
+        v1 = (pts[i][0]-cen[0], pts[i][1]-cen[1], pts[i][2]-cen[2])
+        p2 = pts[(i+1) % len(pts)]
+        v2 = (p2[0]-cen[0], p2[1]-cen[1], p2[2]-cen[2])
+        c = _cross(v1, v2)
+        nvec = (nvec[0]+c[0], nvec[1]+c[1], nvec[2]+c[2])
+    nn = _norm(nvec)
+    if nn < 1e-12:
+        return cen, (float("nan"), float("nan"), float("nan"))
+    return cen, _scale(nvec, 1.0/nn)
+
+
+def point_abs_distance_to_plane(point, plane_point, unit_normal):
+    if any(math.isnan(x) for x in unit_normal):
+        return float("nan")
+    rel = (point[0]-plane_point[0], point[1]-plane_point[1], point[2]-plane_point[2])
+    return abs(_dot(rel, unit_normal))
+
+
+def angle_axis_to_plane_deg(axis_vec, unit_normal):
+    """Acute angle between an axis and a plane: 0=in plane, 90=normal to plane."""
+    na = _norm(axis_vec)
+    if na < 1e-12 or any(math.isnan(x) for x in unit_normal):
+        return float("nan")
+    cos_to_normal = abs(_dot(_scale(axis_vec, 1.0/na), unit_normal))
+    cos_to_normal = max(0.0, min(1.0, cos_to_normal))
+    angle_to_normal = math.degrees(math.acos(cos_to_normal))
+    return 90.0 - angle_to_normal
+
+
+def write_phenyl_ring_mapping(structures, mappings, ring_ref, candidates, mode):
+    fields = ["structure", "reference_ring_atoms", "mapped_ring_atoms", "selection_mode", "candidate_rings_in_reference"]
+    cand = " | ".join(";".join(map(str, c)) for c in candidates)
+    with open(PHENYL_RING_OUT, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for name in structures:
+            w.writerow({
+                "structure": name,
+                "reference_ring_atoms": ";".join(map(str, ring_ref)),
+                "mapped_ring_atoms": ";".join(map(str, mapped_ring_indices(mappings[name], ring_ref))),
+                "selection_mode": mode,
+                "candidate_rings_in_reference": cand,
+            })
+
+
+# ============================================================
+# LIGAND METHYL-GROUP ANALYSIS
+# ============================================================
+
+def centroid_from_atoms(atom_list):
+    if not atom_list:
+        return (float("nan"), float("nan"), float("nan"))
+    n = float(len(atom_list))
+    return (
+        sum(a["x"] for a in atom_list) / n,
+        sum(a["y"] for a in atom_list) / n,
+        sum(a["z"] for a in atom_list) / n,
+    )
+
+
+def midpoint_atoms(a, b):
+    return (
+        0.5 * (a["x"] + b["x"]),
+        0.5 * (a["y"] + b["y"]),
+        0.5 * (a["z"] + b["z"]),
+    )
+
+
+def point_distance(p, q):
+    return math.sqrt(
+        (p[0] - q[0]) ** 2 +
+        (p[1] - q[1]) ** 2 +
+        (p[2] - q[2]) ** 2
+    )
+
+
+def atom_point(a):
+    return (a["x"], a["y"], a["z"])
+
+
+def ligand_neighbors(atoms, center_idx):
+    """Infer covalent neighbors of one ligand atom using the same BOND_SCALE."""
+    ad = atom_dict(atoms)
+    if center_idx not in ad:
+        raise RuntimeError(f"Missing atom index {center_idx}")
+    c = ad[center_idx]
+    neigh = []
+    for a in atoms:
+        if a["index"] == center_idx:
+            continue
+        # For methyl identification, only bonds within the ligand are relevant.
+        if not (LIG_START <= a["index"] <= LIG_END):
+            continue
+        if distance(c, a) <= bond_cutoff(c["element"], a["element"]):
+            neigh.append(a)
+    return neigh
+
+
+def find_ligand_methyl_candidates(atoms):
+    """
+    Detect ligand methyl carbons as ligand C atoms bonded to exactly 3 H atoms
+    and exactly 1 non-H ligand atom under the connectivity cutoff.
+
+    This is only an atom-index helper. The script never assigns chemical labels
+    such as quinoline_Me or pyridine_Me automatically.
+    """
+    out = []
+    for a in atoms:
+        if not (LIG_START <= a["index"] <= LIG_END):
+            continue
+        if a["element"] != "C":
+            continue
+        neigh = ligand_neighbors(atoms, a["index"])
+        hs = sorted(x["index"] for x in neigh if x["element"] == "H")
+        heavy = [x for x in neigh if x["element"] != "H"]
+        if len(hs) == 3 and len(heavy) == 1:
+            out.append({
+                "center_idx": a["index"],
+                "H_indices": hs,
+                "anchor_idx": heavy[0]["index"],
+                "anchor_element": heavy[0]["element"],
+            })
+    out.sort(key=lambda x: x["center_idx"])
+    return out
+
+
+def resolve_methyl_groups(ref_atoms):
+    """
+    Resolve user-specified methyl centers against detected ligand methyl groups.
+
+    Returns:
+      resolved[label] = candidate metadata
+      candidates      = all detected methyl candidates
+
+    Unspecified labels (None) are intentionally left unresolved rather than
+    guessed from atom order.
+    """
+    candidates = find_ligand_methyl_candidates(ref_atoms)
+    by_center = {x["center_idx"]: x for x in candidates}
+    resolved = {}
+
+    used = set()
+    for label, idx in METHYL_CENTERS.items():
+        if idx is None:
+            continue
+        if idx in used:
+            raise RuntimeError(f"Methyl carbon C{idx} assigned to more than one label")
+        if idx not in by_center:
+            raise RuntimeError(
+                f"Configured {label}=C{idx}, but C{idx} was not detected as a ligand CH3 carbon. "
+                f"Detected candidates: {sorted(by_center)}"
+            )
+        resolved[label] = dict(by_center[idx])
+        used.add(idx)
+
+    return resolved, candidates
+
+
+
+
+def heavy_ligand(atoms):
+    """All non-H ligand atoms in the configured ligand index block."""
+    return [
+        a for a in atoms
+        if LIG_START <= a["index"] <= LIG_END and a["element"] != "H"
+    ]
+
+
+def build_ligand_graph(atoms):
+    """Connectivity graph for ligand heavy atoms only."""
+    heavy = heavy_ligand(atoms)
+    graph = {a["index"]: set() for a in heavy}
+    adict = {a["index"]: a for a in heavy}
+    for i in range(len(heavy)):
+        for j in range(i + 1, len(heavy)):
+            a, b = heavy[i], heavy[j]
+            if distance(a, b) <= bond_cutoff(a["element"], b["element"]):
+                graph[a["index"]].add(b["index"])
+                graph[b["index"]].add(a["index"])
+    return graph, adict
+
+
+def best_ligand_mapping(ref_atoms_all, target_atoms_all):
+    """
+    Graph-map REFERENCE ligand heavy atoms onto a target structure.
+
+    The mapping is chosen by the same internal-distance-matrix RMS criterion
+    used for the substrate. This does NOT require matching atom numbers.
+    """
+    rg, ra = build_ligand_graph(ref_atoms_all)
+    tg, ta = build_ligand_graph(target_atoms_all)
+    mappings = find_mappings(rg, ra, tg, ta)
+    if not mappings:
+        raise RuntimeError("No ligand heavy-atom graph mapping found")
+    scored = [(distance_matrix_rms(m, ra, ta), m) for m in mappings]
+    scored.sort(key=lambda x: x[0])
+    return scored[0][1], scored[0][0], len(mappings)
+
+
+def map_named_methyls_to_structures(structures, ref_methyl_meta_by_label):
+    """
+    Map named methyl groups defined in REFERENCE numbering onto every structure.
+
+    Returns
+    -------
+    methyl_meta_by_structure[name][label] : metadata in that structure's numbering
+    ligand_mapping_meta[name] : (distance_matrix_rms_A, n_graph_mappings)
+    ligand_mappings[name] : heavy-atom map ref_index -> target_index
+    """
+    ref_atoms = structures[REFERENCE]
+    ref_graph, _ = build_ligand_graph(ref_atoms)
+    ligand_mappings = {REFERENCE: {i: i for i in ref_graph}}
+    ligand_mapping_meta = {REFERENCE: (0.0, 1)}
+    methyl_meta_by_structure = {}
+
+    for name, atoms in structures.items():
+        if name != REFERENCE:
+            m, score, nmaps = best_ligand_mapping(ref_atoms, atoms)
+            ligand_mappings[name] = m
+            ligand_mapping_meta[name] = (score, nmaps)
+
+        candidate_by_center = {
+            x["center_idx"]: x for x in find_ligand_methyl_candidates(atoms)
+        }
+        mapped = {}
+        for label, ref_meta in ref_methyl_meta_by_label.items():
+            ref_center = ref_meta["center_idx"]
+            target_center = ligand_mappings[name][ref_center]
+            if target_center not in candidate_by_center:
+                raise RuntimeError(
+                    f"{name}: reference {label} C{ref_center} mapped to C{target_center}, "
+                    "but that atom is not detected as a CH3 carbon in the target structure."
+                )
+            meta = dict(candidate_by_center[target_center])
+            meta["reference_center_idx"] = ref_center
+            meta["reference_anchor_idx"] = ref_meta["anchor_idx"]
+            mapped[label] = meta
+        methyl_meta_by_structure[name] = mapped
+
+    return methyl_meta_by_structure, ligand_mapping_meta, ligand_mappings
+
+
+def write_methyl_mapping_report(methyl_meta_by_structure, ligand_mapping_meta):
+    fields = [
+        "structure", "methyl_label",
+        "reference_methyl_center", "mapped_methyl_center",
+        "mapped_attached_H_atoms", "mapped_anchor_atom", "mapped_anchor_element",
+        "ligand_mapping_distance_matrix_RMS_A", "n_ligand_graph_mappings",
+    ]
+    rows = []
+    for name, by_label in methyl_meta_by_structure.items():
+        score, nmaps = ligand_mapping_meta[name]
+        for label, meta in by_label.items():
+            rows.append({
+                "structure": name,
+                "methyl_label": label,
+                "reference_methyl_center": meta["reference_center_idx"],
+                "mapped_methyl_center": meta["center_idx"],
+                "mapped_attached_H_atoms": ";".join(map(str, meta["H_indices"])),
+                "mapped_anchor_atom": meta["anchor_idx"],
+                "mapped_anchor_element": meta["anchor_element"],
+                "ligand_mapping_distance_matrix_RMS_A": score,
+                "n_ligand_graph_mappings": nmaps,
+            })
+    with open(METHYL_MAPPING_OUT, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for row in rows:
+            w.writerow({k: fmt(v) for k, v in row.items()})
+
+
+def methyl_group_atoms(atoms, methyl_meta):
+    """Return CH3 atoms: methyl carbon + its three attached H atoms."""
+    ad = atom_dict(atoms)
+    ids = [methyl_meta["center_idx"]] + list(methyl_meta["H_indices"])
+    missing = [i for i in ids if i not in ad]
+    if missing:
+        raise RuntimeError(f"Missing methyl-group atoms: {missing}")
+    return [ad[i] for i in ids]
+
+
+def methyl_group_descriptors(atoms, methyl_meta, forming_info, phenyl_ring_indices):
+    """
+    Geometry of one ligand methyl group relative to the substrate.
+
+    Contact quantities are neutral vdW-proximity descriptors, not energetic
+    penalties.  The forming-C midpoint is retained as a reaction-coordinate
+    reference, but phenyl-ring centroid/plane descriptors are the preferred
+    measures for the two methyl groups vs substrate conformation.
+    """
+    ad = atom_dict(atoms)
+    mC = ad[methyl_meta["center_idx"]]
+    group_atoms = methyl_group_atoms(atoms, methyl_meta)
+
+    subheavy_idx = [a["index"] for a in heavy_substrate(atoms)]
+    suball_idx = [a["index"] for a in substrate_atoms(atoms)]
+
+    ch3_to_subheavy = build_contact_list(atoms, subheavy_idx, group_atoms)
+    ch3_to_suball = build_contact_list(atoms, suball_idx, group_atoms)
+
+    sh_summary = summarize_contacts(ch3_to_subheavy)
+    sa_summary = summarize_contacts(ch3_to_suball)
+
+    c1 = ad[forming_info["mapped_C1"]]
+    c2 = ad[forming_info["mapped_C2"]]
+    rxn_mid = midpoint_atoms(c1, c2)
+    subheavy_centroid = centroid_from_atoms(heavy_substrate(atoms))
+
+    phenyl_atoms = [ad[i] for i in phenyl_ring_indices]
+    phenyl_centroid, phenyl_normal = ring_centroid_and_normal(atoms, phenyl_ring_indices)
+    ch3_to_phenylC = build_contact_list(atoms, phenyl_ring_indices, group_atoms)
+    phenyl_summary = summarize_contacts(ch3_to_phenylC)
+
+    # Closest substrate contact involving any CH3 atom.
+    closest = ch3_to_suball[0] if ch3_to_suball else None
+
+    return {
+        "center_idx": methyl_meta["center_idx"],
+        "H_indices": list(methyl_meta["H_indices"]),
+        "anchor_idx": methyl_meta["anchor_idx"],
+        "anchor_element": methyl_meta["anchor_element"],
+        "CH3_to_subheavy_summary": sh_summary,
+        "CH3_to_suball_summary": sa_summary,
+        "CH3_to_subheavy_contacts": ch3_to_subheavy,
+        "CH3_to_suball_contacts": ch3_to_suball,
+        "methylC_to_forming_C1_A": distance(mC, c1),
+        "methylC_to_forming_C2_A": distance(mC, c2),
+        "methylC_to_forming_CC_midpoint_A": point_distance(atom_point(mC), rxn_mid),
+        "methylC_to_subheavy_centroid_A": point_distance(atom_point(mC), subheavy_centroid),
+        "methylC_to_phenyl_centroid_A": point_distance(atom_point(mC), phenyl_centroid),
+        "methylC_abs_distance_to_phenyl_plane_A": point_abs_distance_to_plane(atom_point(mC), phenyl_centroid, phenyl_normal),
+        "CH3_to_phenylC_summary": phenyl_summary,
+        "CH3_to_phenylC_contacts": ch3_to_phenylC,
+        "closest_substrate_atom": closest["sub_idx"] if closest else "",
+        "closest_substrate_element": closest["sub_element"] if closest else "",
+        "closest_methyl_atom": closest["partner_idx"] if closest else "",
+        "closest_distance_A": closest["distance_A"] if closest else float("nan"),
+        "closest_vdw_gap_A": closest["vdw_gap_A"] if closest else float("nan"),
+    }
+
+
+def methyl_pair_descriptors(atoms, methyl_results, forming_info, phenyl_ring_indices):
+    """
+    Describe substrate placement relative to the axis connecting the two named
+    methyl carbons.
+
+    For METHYL_PAIR_ORDER = (quinoline_Me, pyridine_Me), positive signed
+    shift points toward pyridine_Me.  Phenyl-ring centroid placement is the
+    preferred conformational descriptor; forming-C midpoint values are retained
+    only as complementary reaction-coordinate descriptors.
+    """
+    label_a, label_b = METHYL_PAIR_ORDER
+    if label_a not in methyl_results or label_b not in methyl_results:
+        return {}
+
+    ad = atom_dict(atoms)
+    ma = ad[methyl_results[label_a]["center_idx"]]
+    mb = ad[methyl_results[label_b]["center_idx"]]
+    c1 = ad[forming_info["mapped_C1"]]
+    c2 = ad[forming_info["mapped_C2"]]
+
+    pa = atom_point(ma)
+    pb = atom_point(mb)
+    mmid = (
+        0.5 * (pa[0] + pb[0]),
+        0.5 * (pa[1] + pb[1]),
+        0.5 * (pa[2] + pb[2]),
+    )
+    rxn_mid = midpoint_atoms(c1, c2)
+    sub_cent = centroid_from_atoms(heavy_substrate(atoms))
+    phenyl_cent, phenyl_normal = ring_centroid_and_normal(atoms, phenyl_ring_indices)
+
+    axis = (pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2])
+    axis_len = _norm(axis)
+    if axis_len < 1e-12:
+        return {}
+    u = _scale(axis, 1.0 / axis_len)
+
+    def decompose(point):
+        rel = (point[0] - mmid[0], point[1] - mmid[1], point[2] - mmid[2])
+        signed = _dot(rel, u)
+        perp_vec = _sub(rel, _scale(u, signed))
+        return signed, _norm(perp_vec)
+
+    rxn_signed, rxn_perp = decompose(rxn_mid)
+    sub_signed, sub_perp = decompose(sub_cent)
+    phenyl_signed, phenyl_perp = decompose(phenyl_cent)
+
+    d_a_rxn = point_distance(pa, rxn_mid)
+    d_b_rxn = point_distance(pb, rxn_mid)
+    d_a_ph = point_distance(pa, phenyl_cent)
+    d_b_ph = point_distance(pb, phenyl_cent)
+
+    return {
+        "methyl_pair_label_A": label_a,
+        "methyl_pair_label_B": label_b,
+        "methylC_pair_distance_A": axis_len,
+        "rxn_midpoint_distance_to_A_A": d_a_rxn,
+        "rxn_midpoint_distance_to_B_A": d_b_rxn,
+        "rxn_midpoint_distance_bias_AminusB_A": d_a_rxn - d_b_rxn,
+        "rxn_midpoint_signed_shift_A_to_B_A": rxn_signed,
+        "rxn_midpoint_perp_distance_to_methyl_axis_A": rxn_perp,
+        "phenyl_centroid_distance_to_A_A": d_a_ph,
+        "phenyl_centroid_distance_to_B_A": d_b_ph,
+        "phenyl_centroid_distance_bias_AminusB_A": d_a_ph - d_b_ph,
+        "phenyl_centroid_signed_shift_A_to_B_A": phenyl_signed,
+        "phenyl_centroid_perp_distance_to_methyl_axis_A": phenyl_perp,
+        "methyl_axis_angle_to_phenyl_plane_deg": angle_axis_to_plane_deg(axis, phenyl_normal),
+        "substrate_heavy_centroid_signed_shift_A_to_B_A": sub_signed,
+        "substrate_heavy_centroid_perp_distance_to_methyl_axis_A": sub_perp,
+    }
+
+
+def write_methyl_candidates(ref_atoms, resolved, candidates):
+    label_by_center = {v["center_idx"]: k for k, v in resolved.items()}
+    fields = [
+        "methyl_carbon", "attached_H_atoms", "anchor_atom", "anchor_element",
+        "configured_label", "note",
+    ]
+    with open(METHYL_CANDIDATES_OUT, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for c in candidates:
+            idx = c["center_idx"]
+            w.writerow({
+                "methyl_carbon": idx,
+                "attached_H_atoms": ";".join(map(str, c["H_indices"])),
+                "anchor_atom": c["anchor_idx"],
+                "anchor_element": c["anchor_element"],
+                "configured_label": label_by_center.get(idx, ""),
+                "note": "candidate only; chemical identity is not auto-assigned",
+            })
+
+
+def write_long_methyl_contacts(structures, methyl_meta_by_structure):
+    fields = [
+        "structure", "mechanism", "stereo", "methyl_label", "methyl_center",
+        "substrate_atom", "substrate_element", "methyl_atom", "methyl_element",
+        "distance_A", "vdw_gap_A", "vdw_overlap_depth_A", "is_vdw_overlap",
+        f"is_proximity_gap_le_{PROXIMITY_GAP_A:.2f}A", "interpretation_warning",
+    ]
+    rows = []
+    for name, atoms in structures.items():
+        suball_idx = [a["index"] for a in substrate_atoms(atoms)]
+        for label, meta in methyl_meta_by_structure.get(name, {}).items():
+            contacts = build_contact_list(atoms, suball_idx, methyl_group_atoms(atoms, meta))
+            for c in contacts:
+                rows.append({
+                    "structure": name,
+                    "mechanism": mechanism_label(name),
+                    "stereo": stereo_label(name),
+                    "methyl_label": label,
+                    "methyl_center": meta["center_idx"],
+                    "substrate_atom": c["sub_idx"],
+                    "substrate_element": c["sub_element"],
+                    "methyl_atom": c["partner_idx"],
+                    "methyl_element": c["partner_element"],
+                    "distance_A": c["distance_A"],
+                    "vdw_gap_A": c["vdw_gap_A"],
+                    "vdw_overlap_depth_A": c["vdw_overlap_depth_A"],
+                    "is_vdw_overlap": c["is_vdw_overlap"],
+                    f"is_proximity_gap_le_{PROXIMITY_GAP_A:.2f}A": c["is_proximity"],
+                    "interpretation_warning": "geometric CH3...substrate proximity only; energetic sign not assigned",
+                })
+    rows.sort(key=lambda r: (r["structure"], r["methyl_label"], r["vdw_gap_A"]))
+    with open(METHYL_LONG_OUT, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for row in rows:
+            w.writerow({k: fmt(v) for k, v in row.items()})
+
+
+# ============================================================
+# PRIMARY FORMING C-O PAIRS + OCCO
+# ============================================================
+
+def auto_detect_forming_c_ref(ref_atoms):
+    ad = atom_dict(ref_atoms)
+    oxy = [ad[i] for i in REACTIVE_O]
+    carbons = [a for a in heavy_substrate(ref_atoms) if a["element"] == "C"]
+    if len(carbons) < 2:
+        raise RuntimeError("Fewer than two substrate carbon atoms found")
+
+    best = None
+    for i in range(len(carbons)):
+        for j in range(i + 1, len(carbons)):
+            c1, c2 = carbons[i], carbons[j]
+            s1 = distance(oxy[0], c1) + distance(oxy[1], c2)
+            s2 = distance(oxy[0], c2) + distance(oxy[1], c1)
+            score = min(s1, s2)
+            if best is None or score < best[0]:
+                best = (score, c1["index"], c2["index"])
+    return (best[1], best[2])
+
+
+def forming_bond_descriptors(atoms, mapping, forming_c_ref):
+    ad = atom_dict(atoms)
+    cA_ref, cB_ref = forming_c_ref
+    cA = mapping[cA_ref]
+    cB = mapping[cB_ref]
+
+    if FORMING_O_FOR_REF_C is not None:
+        missing = [c for c in forming_c_ref if c not in FORMING_O_FOR_REF_C]
+        if missing:
+            raise RuntimeError(
+                "FORMING_O_FOR_REF_C missing reference carbon(s): " +
+                ", ".join(map(str, missing))
+            )
+        oA = FORMING_O_FOR_REF_C[cA_ref]
+        oB = FORMING_O_FOR_REF_C[cB_ref]
+        if oA == oB:
+            raise RuntimeError("The two primary C-O pairs cannot use the same oxygen atom")
+        pairing_mode = "manual_fixed"
+        swapped = int((oA, oB) == (REACTIVE_O[1], REACTIVE_O[0]))
+    else:
+        o1, o2 = REACTIVE_O
+        d11 = distance(ad[o1], ad[cA])
+        d22 = distance(ad[o2], ad[cB])
+        d12 = distance(ad[o1], ad[cB])
+        d21 = distance(ad[o2], ad[cA])
+
+        if d11 + d22 <= d12 + d21:
+            oA, oB = o1, o2
+            swapped = 0
+        else:
+            oA, oB = o2, o1
+            swapped = 1
+        pairing_mode = "auto_shorter_total_distance"
+
+    dA = distance(ad[oA], ad[cA])
+    dB = distance(ad[oB], ad[cB])
+    short_d, long_d = sorted((dA, dB))
+
+    occo_signed = dihedral_deg(ad[oA], ad[cA], ad[cB], ad[oB])
+    if math.isnan(occo_signed):
+        occo_abs = float("nan")
+        occo_twist = float("nan")
+    else:
+        occo_abs = abs(occo_signed)
+        occo_twist = min(occo_abs, 180.0 - occo_abs)
+
+    return {
+        "ref_C1": cA_ref,
+        "ref_C2": cB_ref,
+        "mapped_C1": cA,
+        "mapped_C2": cB,
+        "O_on_C1": oA,
+        "O_on_C2": oB,
+        "C1O_distance_A": dA,
+        "C2O_distance_A": dB,
+        "pairing_mode": pairing_mode,
+        "pairing_swapped": swapped,
+        "CO_short_A": short_d,
+        "CO_long_A": long_d,
+        "CO_mean_A": 0.5 * (short_d + long_d),
+        "CO_sum_A": short_d + long_d,
+        "CO_asym_A": long_d - short_d,
+        "OCCO_dihedral_signed_deg": occo_signed,
+        "OCCO_dihedral_abs_deg": occo_abs,
+        "OCCO_twist_from_coplanar_deg": occo_twist,
+        "primary_pairs": {(cA, oA), (cB, oB)},
+    }
+
+
+# ============================================================
+# GROUP ANALYSIS
+# ============================================================
+
+def group_analysis(atoms, mapping, ref_groups, forming_info, include_sub_H=False):
+    hparents = assign_hydrogens(atoms)
+    lig = ligand_atoms(atoms)
+    oxy = reactive_oxygen_atoms(atoms)
+    ad = atom_dict(atoms)
+    result = {}
+
+    for gid, ref_group in enumerate(ref_groups, start=1):
+        mapped_heavy = [mapping[r] for r in ref_group]
+        indices = list(mapped_heavy)
+        if include_sub_H:
+            for hv in mapped_heavy:
+                indices.extend(hparents.get(hv, []))
+
+        lig_contacts = build_contact_list(atoms, indices, lig)
+        secO_contacts = build_contact_list(
+            atoms, indices, oxy,
+            skip_pairs=forming_info["primary_pairs"]
+        )
+
+        raw_o_distances = [
+            distance(ad[si], ad[oi])
+            for si in indices
+            for oi in REACTIVE_O
+        ]
+
+        result[gid] = {
+            "ref_group": ref_group,
+            "mapped_heavy": sorted(mapped_heavy),
+            "sub_indices": sorted(indices),
+            "lig_contacts": lig_contacts,
+            "lig_summary": summarize_contacts(lig_contacts),
+            "secondary_O_contacts": secO_contacts,
+            "secondary_O_summary": summarize_contacts(secO_contacts),
+            # Includes assigned primary C-O distances by design.
+            "O_any_min_distance_including_primary_A": (
+                min(raw_o_distances) if raw_o_distances else float("nan")
+            ),
+        }
+    return result
+
+
+def aggregate_group_results(group_results, key_summary):
+    summaries = [x[key_summary] for x in group_results.values()]
+    gaps = [s["min_vdw_gap_A"] for s in summaries if not math.isnan(s["min_vdw_gap_A"])]
+    dmins = [s["min_distance_A"] for s in summaries if not math.isnan(s["min_distance_A"])]
+    return {
+        "min_distance_A": min(dmins) if dmins else float("nan"),
+        "min_vdw_gap_A": min(gaps) if gaps else float("nan"),
+        "vdw_overlap_sum_A": sum(s["vdw_overlap_sum_A"] for s in summaries),
+        "n_vdw_overlap": sum(s["n_vdw_overlap"] for s in summaries),
+        "n_proximity": sum(s["n_proximity"] for s in summaries),
+        "n_pairs": sum(s["n_pairs"] for s in summaries),
+    }
+
+
+# ============================================================
+# OUTPUT HELPERS
+# ============================================================
+
+def fmt(x):
+    if isinstance(x, float):
+        if math.isnan(x):
+            return ""
+        return f"{x:.6f}"
+    return x
+
+
+def mechanism_label(name):
+    return "step" if name.startswith("step_") else "con"
+
+
+def stereo_label(name):
+    if "_R" in name:
+        return "R"
+    if "_S" in name:
+        return "S"
+    return ""
+
+
+def write_symmetry_files(ref_atoms, groups, nautos):
+    ad = atom_dict(ref_atoms)
+    with open("substrate_symmetry_groups_v12_5.csv", "w", newline="", encoding="utf-8") as f:
+        fields = ["group", "reference_atoms", "elements", "heavy_group_size"]
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for i, group in enumerate(groups, start=1):
+            w.writerow({
+                "group": f"G{i:02d}",
+                "reference_atoms": ";".join(str(x) for x in group),
+                "elements": ";".join(ad[x]["element"] for x in group),
+                "heavy_group_size": len(group),
+            })
+
+    with open("symmetry_report_v12_5.txt", "w", encoding="utf-8") as f:
+        f.write(f"Number of substrate graph automorphisms: {nautos}\n")
+        f.write(f"Number of symmetry groups: {len(groups)}\n")
+        for i, group in enumerate(groups, start=1):
+            f.write(f"G{i:02d}: {' '.join(str(x) for x in group)}\n")
+
+
+def write_group_table(results, outfile, label):
+    fields = [
+        "structure", "group", "reference_atoms", "mapped_heavy_atoms",
+        "substrate_atoms_in_group", "substrate_group_size",
+        "lig_min_distance_A", "lig_min_vdw_gap_A", "lig_vdw_overlap_sum_A",
+        "lig_vdw_overlap_per_subatom_A", "lig_n_vdw_overlap",
+        f"lig_n_proximity_gap_le_{PROXIMITY_GAP_A:.2f}A", "lig_top_contacts",
+        "O_any_min_distance_including_primary_A",
+        "secondary_O_min_distance_A", "secondary_O_min_vdw_gap_A",
+        "secondary_O_vdw_overlap_sum_A", "secondary_O_vdw_overlap_per_subatom_A",
+        "secondary_O_n_vdw_overlap",
+        f"secondary_O_n_proximity_gap_le_{PROXIMITY_GAP_A:.2f}A",
+        "secondary_O_top_contacts",
+        "definition",
+    ]
+
+    rows = []
+    for structure_name, group_results in results.items():
+        for gid, item in group_results.items():
+            ls = item["lig_summary"]
+            os = item["secondary_O_summary"]
+            nsub = len(item["sub_indices"])
+            rows.append({
+                "structure": structure_name,
+                "group": f"G{gid:02d}",
+                "reference_atoms": ";".join(str(x) for x in item["ref_group"]),
+                "mapped_heavy_atoms": ";".join(str(x) for x in item["mapped_heavy"]),
+                "substrate_atoms_in_group": ";".join(str(x) for x in item["sub_indices"]),
+                "substrate_group_size": nsub,
+                "lig_min_distance_A": ls["min_distance_A"],
+                "lig_min_vdw_gap_A": ls["min_vdw_gap_A"],
+                "lig_vdw_overlap_sum_A": ls["vdw_overlap_sum_A"],
+                "lig_vdw_overlap_per_subatom_A": ls["vdw_overlap_sum_A"] / nsub if nsub else float("nan"),
+                "lig_n_vdw_overlap": ls["n_vdw_overlap"],
+                f"lig_n_proximity_gap_le_{PROXIMITY_GAP_A:.2f}A": ls["n_proximity"],
+                "lig_top_contacts": top_contacts_string(item["lig_contacts"]),
+                "O_any_min_distance_including_primary_A": item["O_any_min_distance_including_primary_A"],
+                "secondary_O_min_distance_A": os["min_distance_A"],
+                "secondary_O_min_vdw_gap_A": os["min_vdw_gap_A"],
+                "secondary_O_vdw_overlap_sum_A": os["vdw_overlap_sum_A"],
+                "secondary_O_vdw_overlap_per_subatom_A": os["vdw_overlap_sum_A"] / nsub if nsub else float("nan"),
+                "secondary_O_n_vdw_overlap": os["n_vdw_overlap"],
+                f"secondary_O_n_proximity_gap_le_{PROXIMITY_GAP_A:.2f}A": os["n_proximity"],
+                "secondary_O_top_contacts": top_contacts_string(item["secondary_O_contacts"]),
+                "definition": label,
+            })
+
+    rows.sort(key=lambda r: (r["group"], r["structure"]))
+    with open(outfile, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for row in rows:
+            w.writerow({k: fmt(v) for k, v in row.items()})
+
+
+def write_primary_pairs(structures, forming_infos):
+    fields = [
+        "structure", "mechanism", "stereo", "pairing_mode", "pairing_swapped",
+        "ref_C1", "mapped_C1", "O_on_C1", "C1O_distance_A",
+        "ref_C2", "mapped_C2", "O_on_C2", "C2O_distance_A",
+        "CO_short_A", "CO_long_A", "CO_mean_A", "CO_asym_A",
+        "OCCO_dihedral_signed_deg", "OCCO_dihedral_abs_deg",
+        "OCCO_twist_from_coplanar_deg",
+    ]
+    with open(PRIMARY_PAIRS_OUT, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for name in structures:
+            fi = forming_infos[name]
+            row = {
+                "structure": name,
+                "mechanism": mechanism_label(name),
+                "stereo": stereo_label(name),
+                "pairing_mode": fi["pairing_mode"],
+                "pairing_swapped": fi["pairing_swapped"],
+                "ref_C1": fi["ref_C1"],
+                "mapped_C1": fi["mapped_C1"],
+                "O_on_C1": fi["O_on_C1"],
+                "C1O_distance_A": fi["C1O_distance_A"],
+                "ref_C2": fi["ref_C2"],
+                "mapped_C2": fi["mapped_C2"],
+                "O_on_C2": fi["O_on_C2"],
+                "C2O_distance_A": fi["C2O_distance_A"],
+                "CO_short_A": fi["CO_short_A"],
+                "CO_long_A": fi["CO_long_A"],
+                "CO_mean_A": fi["CO_mean_A"],
+                "CO_asym_A": fi["CO_asym_A"],
+                "OCCO_dihedral_signed_deg": fi["OCCO_dihedral_signed_deg"],
+                "OCCO_dihedral_abs_deg": fi["OCCO_dihedral_abs_deg"],
+                "OCCO_twist_from_coplanar_deg": fi["OCCO_twist_from_coplanar_deg"],
+            }
+            w.writerow({k: fmt(v) for k, v in row.items()})
+
+
+def write_long_secondary_O_contacts(structures, forming_infos):
+    fields = [
+        "structure", "mechanism", "stereo",
+        "substrate_atom", "substrate_element", "oxygen_atom",
+        "distance_A", "vdw_gap_A", "vdw_overlap_depth_A",
+        "is_vdw_overlap", f"is_proximity_gap_le_{PROXIMITY_GAP_A:.2f}A",
+        "contact_class", "interpretation_warning",
+    ]
+
+    rows = []
+    for name, atoms in structures.items():
+        indices = [a["index"] for a in substrate_atoms(atoms)]
+        contacts = build_contact_list(
+            atoms, indices, reactive_oxygen_atoms(atoms),
+            skip_pairs=forming_infos[name]["primary_pairs"]
+        )
+        for c in contacts:
+            el = c["sub_element"]
+            contact_class = f"O...{el}" if el in {"H", "C", "N"} else "O...other"
+            rows.append({
+                "structure": name,
+                "mechanism": mechanism_label(name),
+                "stereo": stereo_label(name),
+                "substrate_atom": c["sub_idx"],
+                "substrate_element": el,
+                "oxygen_atom": c["partner_idx"],
+                "distance_A": c["distance_A"],
+                "vdw_gap_A": c["vdw_gap_A"],
+                "vdw_overlap_depth_A": c["vdw_overlap_depth_A"],
+                "is_vdw_overlap": c["is_vdw_overlap"],
+                f"is_proximity_gap_le_{PROXIMITY_GAP_A:.2f}A": c["is_proximity"],
+                "contact_class": contact_class,
+                "interpretation_warning": "geometric proximity only; energetic sign not assigned",
+            })
+
+    rows.sort(key=lambda r: (r["structure"], r["vdw_gap_A"]))
+    with open(SECONDARY_O_LONG_OUT, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for row in rows:
+            w.writerow({k: fmt(v) for k, v in row.items()})
+
+
+def write_long_ligand_contacts(structures):
+    fields = [
+        "structure", "mechanism", "stereo",
+        "substrate_atom", "substrate_element",
+        "ligand_atom", "ligand_element",
+        "distance_A", "vdw_gap_A", "vdw_overlap_depth_A",
+        "is_vdw_overlap", f"is_proximity_gap_le_{PROXIMITY_GAP_A:.2f}A",
+        "interpretation_warning",
+    ]
+
+    rows = []
+    for name, atoms in structures.items():
+        indices = [a["index"] for a in substrate_atoms(atoms)]
+        contacts = build_contact_list(atoms, indices, ligand_atoms(atoms))
+        for c in contacts:
+            rows.append({
+                "structure": name,
+                "mechanism": mechanism_label(name),
+                "stereo": stereo_label(name),
+                "substrate_atom": c["sub_idx"],
+                "substrate_element": c["sub_element"],
+                "ligand_atom": c["partner_idx"],
+                "ligand_element": c["partner_element"],
+                "distance_A": c["distance_A"],
+                "vdw_gap_A": c["vdw_gap_A"],
+                "vdw_overlap_depth_A": c["vdw_overlap_depth_A"],
+                "is_vdw_overlap": c["is_vdw_overlap"],
+                f"is_proximity_gap_le_{PROXIMITY_GAP_A:.2f}A": c["is_proximity"],
+                "interpretation_warning": "geometric proximity only; not automatically steric/repulsive",
+            })
+
+    rows.sort(key=lambda r: (r["structure"], r["vdw_gap_A"]))
+    with open(LIGAND_LONG_OUT, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for row in rows:
+            w.writerow({k: fmt(v) for k, v in row.items()})
+
+
+def add_contact_summary_fields(row, prefix, summary):
+    row[f"{prefix}_min_distance_A"] = summary["min_distance_A"]
+    row[f"{prefix}_min_vdw_gap_A"] = summary["min_vdw_gap_A"]
+    row[f"{prefix}_vdw_overlap_sum_A"] = summary["vdw_overlap_sum_A"]
+    row[f"{prefix}_n_vdw_overlap"] = summary["n_vdw_overlap"]
+    row[f"{prefix}_n_proximity_gap_le_{PROXIMITY_GAP_A:.2f}A"] = summary["n_proximity"]
+
+
+def write_model_descriptors(structures, mappings, mapping_meta, groups,
+                            subheavy_results, suball_results, forming_infos,
+                            methyl_meta_by_structure, phenyl_ring_ref,
+                            ligand_mappings, reference_atoms):
+    rows = []
+    ref_atoms = reference_atoms
+
+    for name, atoms in structures.items():
+        fi = forming_infos[name]
+        score, nmaps = mapping_meta[name]
+
+        sh_lig = aggregate_group_results(subheavy_results[name], "lig_summary")
+        sa_lig = aggregate_group_results(suball_results[name], "lig_summary")
+        sh_o = aggregate_group_results(subheavy_results[name], "secondary_O_summary")
+        sa_o = aggregate_group_results(suball_results[name], "secondary_O_summary")
+
+        all_sub_indices = [a["index"] for a in substrate_atoms(atoms)]
+        secO_all = build_contact_list(
+            atoms, all_sub_indices, reactive_oxygen_atoms(atoms),
+            skip_pairs=fi["primary_pairs"]
+        )
+
+        sec_by_class = {
+            "H": summarize_contacts(contacts_for_sub_element(secO_all, "H")),
+            "C": summarize_contacts(contacts_for_sub_element(secO_all, "C")),
+            "N": summarize_contacts(contacts_for_sub_element(secO_all, "N")),
+            "other": summarize_contacts(contacts_for_other_elements(secO_all)),
+        }
+
+        row = {
+            "structure": name,
+            "mechanism": mechanism_label(name),
+            "stereo": stereo_label(name),
+            "mapping_distance_matrix_RMS_A": score,
+            "n_graph_mappings": nmaps,
+            "forming_ref_C1": fi["ref_C1"],
+            "forming_ref_C2": fi["ref_C2"],
+            "forming_mapped_C1": fi["mapped_C1"],
+            "forming_mapped_C2": fi["mapped_C2"],
+            "forming_O_on_C1": fi["O_on_C1"],
+            "forming_O_on_C2": fi["O_on_C2"],
+            "forming_C1O_distance_A": fi["C1O_distance_A"],
+            "forming_C2O_distance_A": fi["C2O_distance_A"],
+            "forming_pairing_mode": fi["pairing_mode"],
+            "pairing_swapped": fi["pairing_swapped"],
+            "CO_short_A": fi["CO_short_A"],
+            "CO_long_A": fi["CO_long_A"],
+            "CO_mean_A": fi["CO_mean_A"],
+            "CO_sum_A": fi["CO_sum_A"],
+            "CO_asym_A": fi["CO_asym_A"],
+            "OCCO_dihedral_signed_deg": fi["OCCO_dihedral_signed_deg"],
+            "OCCO_dihedral_abs_deg": fi["OCCO_dihedral_abs_deg"],
+            "OCCO_twist_from_coplanar_deg": fi["OCCO_twist_from_coplanar_deg"],
+        }
+
+        add_contact_summary_fields(row, "subheavy_ligall", sh_lig)
+        add_contact_summary_fields(row, "suball_ligall", sa_lig)
+        add_contact_summary_fields(row, "subheavy_secondaryO", sh_o)
+        add_contact_summary_fields(row, "suball_secondaryO", sa_o)
+
+        for cls, summary in sec_by_class.items():
+            add_contact_summary_fields(row, f"secondaryO_to_{cls}", summary)
+
+        # --------------------------------------------------------
+        # Two named ligand methyl groups vs substrate.
+        # CH3 contact summaries are neutral proximity descriptors.
+        # Methyl-carbon distances track placement of the reaction center.
+        # --------------------------------------------------------
+        methyl_results = {}
+        phenyl_ring_indices = mapped_ring_indices(mappings[name], phenyl_ring_ref)
+        phenyl_centroid, phenyl_normal = ring_centroid_and_normal(atoms, phenyl_ring_indices)
+        row["phenyl_ring_mapped_atoms"] = ";".join(map(str, phenyl_ring_indices))
+        row["phenyl_centroid_x_A"] = phenyl_centroid[0]
+        row["phenyl_centroid_y_A"] = phenyl_centroid[1]
+        row["phenyl_centroid_z_A"] = phenyl_centroid[2]
+
+        # V12: true fragment RMSDs and phenyl-ligand buried contact area.
+        row.update(fragment_rmsd_descriptors(
+            ref_atoms, atoms, mappings[name], ligand_mappings[name], phenyl_ring_ref
+        ))
+        row.update(phenyl_ligand_contact_area_descriptors(atoms, phenyl_ring_indices))
+
+        for label, meta in methyl_meta_by_structure.get(name, {}).items():
+            md = methyl_group_descriptors(atoms, meta, fi, phenyl_ring_indices)
+            methyl_results[label] = md
+
+            clean = label.replace(" ", "_")
+            row[f"{clean}_methylC_index"] = md["center_idx"]
+            row[f"{clean}_anchor_index"] = md["anchor_idx"]
+            row[f"{clean}_methylC_to_forming_C1_A"] = md["methylC_to_forming_C1_A"]
+            row[f"{clean}_methylC_to_forming_C2_A"] = md["methylC_to_forming_C2_A"]
+            row[f"{clean}_methylC_to_forming_CC_midpoint_A"] = md["methylC_to_forming_CC_midpoint_A"]
+            row[f"{clean}_methylC_to_subheavy_centroid_A"] = md["methylC_to_subheavy_centroid_A"]
+            row[f"{clean}_methylC_to_phenyl_centroid_A"] = md["methylC_to_phenyl_centroid_A"]
+            row[f"{clean}_methylC_abs_distance_to_phenyl_plane_A"] = md["methylC_abs_distance_to_phenyl_plane_A"]
+            row[f"{clean}_closest_substrate_atom"] = md["closest_substrate_atom"]
+            row[f"{clean}_closest_substrate_element"] = md["closest_substrate_element"]
+            row[f"{clean}_closest_methyl_atom"] = md["closest_methyl_atom"]
+            row[f"{clean}_closest_distance_A"] = md["closest_distance_A"]
+            row[f"{clean}_closest_vdw_gap_A"] = md["closest_vdw_gap_A"]
+
+            add_contact_summary_fields(
+                row, f"{clean}_CH3_to_subheavy", md["CH3_to_subheavy_summary"]
+            )
+            add_contact_summary_fields(
+                row, f"{clean}_CH3_to_suball", md["CH3_to_suball_summary"]
+            )
+            add_contact_summary_fields(
+                row, f"{clean}_CH3_to_phenylC", md["CH3_to_phenylC_summary"]
+            )
+
+        paird = methyl_pair_descriptors(atoms, methyl_results, fi, phenyl_ring_indices)
+        for k, v in paird.items():
+            row[f"methylpair_{k}"] = v
+
+        # Group-level ligand overlap: sum and per-substrate-atom value.
+        for i in range(1, len(groups) + 1):
+            sh_item = subheavy_results[name][i]
+            sa_item = suball_results[name][i]
+            sh_sum = sh_item["lig_summary"]["vdw_overlap_sum_A"]
+            sa_sum = sa_item["lig_summary"]["vdw_overlap_sum_A"]
+            nsh = len(sh_item["sub_indices"])
+            nsa = len(sa_item["sub_indices"])
+
+            row[f"G{i:02d}_subheavy_size"] = nsh
+            row[f"G{i:02d}_suball_size"] = nsa
+            row[f"G{i:02d}_subheavy_ligall_vdw_overlap_sum_A"] = sh_sum
+            row[f"G{i:02d}_subheavy_ligall_vdw_overlap_per_subatom_A"] = sh_sum / nsh if nsh else float("nan")
+            row[f"G{i:02d}_suball_ligall_vdw_overlap_sum_A"] = sa_sum
+            row[f"G{i:02d}_suball_ligall_vdw_overlap_per_subatom_A"] = sa_sum / nsa if nsa else float("nan")
+            row[f"G{i:02d}_O_any_min_distance_including_primary_A"] = sa_item["O_any_min_distance_including_primary_A"]
+
+        rows.append(row)
+
+    # Stable field order from first row, then any extra fields if ever introduced.
+    fields = []
+    seen = set()
+    for row in rows:
+        for k in row:
+            if k not in seen:
+                fields.append(k)
+                seen.add(k)
+
+    with open(MODEL_OUT, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for row in rows:
+            w.writerow({k: fmt(row.get(k, "")) for k in fields})
+
+    return rows
+
+
+def write_structure_metrics_summary(rows):
+    """Compact RMSD/contact-area table; includes retained cross-TS metrics plus isolated-reference RMSDs."""
+    fields = [
+        "structure", "mechanism", "stereo",
+        "cat_FeLig_heavy_internal_RMSD_A",
+        "cat_FeLigO_heavy_internal_RMSD_A",
+        "substrate_heavy_internal_RMSD_A",
+        "substrate_heavy_pose_RMSD_after_FeLig_alignment_A",
+        "phenyl_ring_pose_RMSD_after_FeLig_alignment_A",
+        "cat_isolated_ref_heavy_RMSD_A",
+        "sub_isolated_ref_heavy_RMSD_A",
+        "cat_isolated_ref_FeN4_core_fit_RMSD_A",
+        "phenyl_contact_group_atoms", "phenyl_contact_group_n_atoms",
+        "phenyl_ligand_min_distance_A", "phenyl_ligand_min_vdw_gap_A",
+        "phenyl_ligand_vdw_overlap_sum_A",
+        "phenyl_ligand_phenyl_buried_SASA_A2",
+        "phenyl_ligand_ligand_buried_SASA_A2",
+        "phenyl_ligand_BSA_total_A2",
+        "phenyl_ligand_interface_area_halfBSA_A2",
+    ]
+    with open(STRUCTURE_METRICS_OUT, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for row in rows:
+            w.writerow({k: fmt(row.get(k, "")) for k in fields})
+
+
+# ============================================================
+# EDA / PREPARATION TABLE PARSING + COMPARISON
+# ============================================================
+
+EDA_CANONICAL_ORDER = [
+    "Bond Energy",
+    "Orbital Energy",
+    "Electrostatic Energy",
+    "Pauli Energy",
+    "Delta E^0(XC)",
+    "Delta Dispersion",
+    "Delta G_sol",
+    "prep_cat",
+    "prep_sub",
+    "preparation",
+]
+
+EDA_REPORT_LABEL = {
+    "Bond Energy": "Bond Energy",
+    "Orbital Energy": "Orbital Energy",
+    "Electrostatic Energy": "Electrostatic Energy",
+    "Pauli Energy": "Pauli Energy",
+    "Delta E^0(XC)": "Δ E0(XC)",
+    "Delta Dispersion": "ΔEdisp",
+    "Delta G_sol": "Δ Gsol",
+    "prep_sub": "ΔEdist_sub",
+    "prep_cat": "ΔEdist_cat",
+    "preparation": "ΔEdist",
+}
+
+
+def _norm_text(x):
+    return re.sub(r"\s+", " ", str(x).strip()).lower()
+
+
+def _canonical_eda_label(label):
+    """Canonicalize the exact row labels used in the user's EDA matrix.
+
+    Supported examples (formatting/punctuation may vary):
+      Bond Energy
+      Orbital Energy
+      Electrostatic Energy
+      Pauli Energy
+      delta E0XC / Δ E0(XC) / Δ E^0_(XC)
+      deltaEdisp / ΔE_disp
+      delta Gsol / Δ G_sol
+      delta Edist_sub / ΔEdist_sub / ΔE_dist_sub
+      deltaEdist_cat / ΔEdist_cat / ΔE_dist_cat
+      delta Edist / ΔEdist / ΔE_dist
+
+    Matching deliberately ignores spaces, underscores, parentheses, hyphens,
+    superscript formatting and whether Delta is written as Δ or 'delta'.
+    """
+    import unicodedata
+
+    raw = unicodedata.normalize("NFKC", str(label)).strip()
+    if not raw:
+        return None
+
+    # Normalize common spreadsheet variants before stripping punctuation.
+    x = raw
+    x = x.replace("Δ", "delta").replace("δ", "delta").replace("∆", "delta")
+    x = x.replace("−", "-").replace("–", "-").replace("—", "-")
+    x = x.replace("⁰", "0").replace("^0", "0")
+    x = x.lower()
+    # Keep only ASCII letters/numbers. Thus all of these collapse identically:
+    # delta E0(XC), delta_E0XC, Δ E^0_(XC) -> deltae0xc
+    token = re.sub(r"[^a-z0-9]+", "", x)
+
+    table = {
+        "bondenergy": "Bond Energy",
+        "orbitalenergy": "Orbital Energy",
+        "electrostaticenergy": "Electrostatic Energy",
+        "paulienergy": "Pauli Energy",
+        "deltae0xc": "Delta E^0(XC)",
+        "de0xc": "Delta E^0(XC)",
+        "deltaedisp": "Delta Dispersion",
+        "deltaedispersion": "Delta Dispersion",
+        "dedisp": "Delta Dispersion",
+        "deltagsol": "Delta G_sol",
+        "dgsol": "Delta G_sol",
+        "deltaedistsub": "prep_sub",
+        "edistsub": "prep_sub",
+        "deltadistsub": "prep_sub",
+        "deltaedistcat": "prep_cat",
+        "edistcat": "prep_cat",
+        "deltadistcat": "prep_cat",
+        "deltaedist": "preparation",
+        "edist": "preparation",
+        "deltadist": "preparation",
+        # internal/output aliases
+        "prepsub": "prep_sub",
+        "prepcat": "prep_cat",
+        "preparation": "preparation",
+    }
+    return table.get(token)
+
+
+def _to_float(cell):
+    """Read a number robustly from an Excel/CSV cell.
+
+    Accepts normal floats and cells with accidental trailing symbols, e.g.
+    '61.22Δ'.  Commas and Unicode minus signs are normalized.  The first
+    numeric token is used; non-numeric cells return None.
+    """
+    if cell is None:
+        return None
+    t = str(cell).strip()
+    if not t:
+        return None
+    t = t.replace("−", "-").replace("–", "-").replace("—", "-").replace(",", "")
+    m = re.search(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?", t)
+    if not m:
+        return None
+    try:
+        return float(m.group(0))
+    except ValueError:
+        return None
+
+def _clean_structure_token(token):
+    t = str(token).strip().replace("\\", "/")
+    if not t:
+        return ""
+    # Rows such as new/con_R_Q23_cat should resolve to con_R_Q23_cat.
+    return t.split("/")[-1]
+
+
+def parse_eda_table(path, known_structures):
+    """
+    Parse either:
+      1) a matrix block with a structure-name header and energy rows, like the
+         current EDA table; optionally followed by name_sub / name_cat rows; or
+      2) a tidy CSV with a 'structure' column and named energy/prep columns.
+
+    Exact structure names are required.  step_S_Q3 is never silently equated to
+    step_S_Q4 (or any other near-match).
+    """
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        rows = list(csv.reader(f))
+    if not rows:
+        raise RuntimeError(f"EDA table is empty: {path}")
+
+    known = set(known_structures)
+    data = {name: {} for name in known_structures}
+
+    # ---------- tidy-table attempt ----------
+    header_idx = None
+    structure_col = None
+    for ir, row in enumerate(rows[:50]):
+        for ic, cell in enumerate(row):
+            if _norm_text(cell) == "structure":
+                header_idx, structure_col = ir, ic
+                break
+        if header_idx is not None:
+            break
+    if header_idx is not None:
+        hdr = rows[header_idx]
+        canon_cols = {}
+        prep_cat_col = prep_sub_col = prep_total_col = None
+        for ic, h in enumerate(hdr):
+            nh = _norm_text(h).replace("-", "_").replace(" ", "_")
+            can = _canonical_eda_label(h)
+            if can:
+                canon_cols[ic] = can
+            if nh in {"prep_cat", "preparation_cat", "cat_preparation", "catalyst_preparation", "catalyst_distortion"}:
+                prep_cat_col = ic
+            elif nh in {"prep_sub", "preparation_sub", "sub_preparation", "substrate_preparation", "substrate_distortion"}:
+                prep_sub_col = ic
+            elif nh in {"prep_total", "preparation_total", "total_preparation", "total_distortion"}:
+                prep_total_col = ic
+        for row in rows[header_idx+1:]:
+            if structure_col >= len(row):
+                continue
+            name = _clean_structure_token(row[structure_col])
+            if name not in known:
+                continue
+            for ic, can in canon_cols.items():
+                if ic < len(row):
+                    val = _to_float(row[ic])
+                    if val is not None:
+                        data[name][can] = val
+            for ic, key in ((prep_cat_col, "prep_cat"), (prep_sub_col, "prep_sub"),
+                            (prep_total_col, "preparation")):
+                if ic is not None and ic < len(row):
+                    val = _to_float(row[ic])
+                    if val is not None:
+                        data[name][key] = val
+
+    # ---------- scan matrix-style energy blocks ----------
+    # Any row containing >=2 exact known structure names can act as a matrix header.
+    for ir, row in enumerate(rows):
+        positions = {}
+        for ic, cell in enumerate(row):
+            name = _clean_structure_token(cell)
+            if name in known:
+                positions[ic] = name
+        if len(positions) < 2:
+            continue
+        # Scan following rows until another name header / a long blank region.
+        for rr in rows[ir+1:min(len(rows), ir+50)]:
+            # The user's EDA matrix has the descriptor in the first non-empty
+            # cell of each row. Read that cell literally, then take values from
+            # the structure columns of the header above.
+            # Find the descriptor label anywhere in the row rather than assuming
+            # it is the first non-empty cell. This supports spreadsheets with a
+            # blank column A and descriptors in column B (as in the current table).
+            label = None
+            label_cell = ""
+            for c in rr:
+                candidate = _canonical_eda_label(c)
+                if candidate is not None:
+                    label = candidate
+                    label_cell = c
+                    break
+            if label is None:
+                continue
+            for ic, name in positions.items():
+                if ic < len(rr):
+                    val = _to_float(rr[ic])
+                    if val is not None:
+                        data[name][label] = val
+
+    # ---------- scan name_cat / name_sub scalar rows anywhere ----------
+    for row in rows:
+        for ic, cell in enumerate(row):
+            token = _clean_structure_token(cell)
+            m = re.fullmatch(r"(.+?)_(cat|sub)", token, flags=re.IGNORECASE)
+            if not m:
+                continue
+            name, frag = m.group(1), m.group(2).lower()
+            if name not in known:
+                continue
+            val = None
+            for cc in row[ic+1:]:
+                val = _to_float(cc)
+                if val is not None:
+                    break
+            if val is not None:
+                data[name]["prep_cat" if frag == "cat" else "prep_sub"] = val
+
+    # If total preparation is absent but cat/sub are available, calculate it.
+    for name, d in data.items():
+        if "preparation" not in d and "prep_cat" in d and "prep_sub" in d:
+            d["preparation"] = d["prep_cat"] + d["prep_sub"]
+        if "preparation" in d and "prep_cat" in d and "prep_sub" in d:
+            d["prep_closure_error"] = d["preparation"] - d["prep_cat"] - d["prep_sub"]
+
+    # Short diagnostic: useful when spreadsheet row labels use symbols/abbreviations.
+    for name in known_structures:
+        found = [k for k in EDA_CANONICAL_ORDER if k in data.get(name, {})]
+        if found:
+            print(f"EDA recognized for {name}: " + ", ".join(EDA_REPORT_LABEL.get(k, k) for k in found))
+        missing = [k for k in EDA_CANONICAL_ORDER if k not in data.get(name, {})]
+        if missing:
+            print(f"EDA missing for {name}: " + ", ".join(EDA_REPORT_LABEL.get(k, k) for k in missing))
+
+    return data
+
+
+def _prep_dominance(cat, sub):
+    if cat is None or sub is None:
+        return "insufficient_data"
+    ac, ass = abs(cat), abs(sub)
+    if abs(ac - ass) <= DISTORTION_EQUAL_TOL:
+        return "equal"
+    return "catalyst" if ac > ass else "substrate"
+
+
+def write_eda_and_distortion_outputs(selected_names, eda_data):
+    # Selected absolute values.
+    fields = ["structure"] + EDA_CANONICAL_ORDER + [
+        "prep_closure_error", "prep_dominant_fragment_absolute",
+        "prep_cat_fraction_of_cat_plus_sub_pct",
+    ]
+    with open(EDA_SELECTED_OUT, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for name in selected_names:
+            d = eda_data.get(name, {})
+            cat = d.get("prep_cat")
+            sub = d.get("prep_sub")
+            denom = (cat + sub) if cat is not None and sub is not None else None
+            row = {"structure": name, **d}
+            row["prep_dominant_fragment_absolute"] = _prep_dominance(cat, sub)
+            row["prep_cat_fraction_of_cat_plus_sub_pct"] = (
+                100.0 * cat / denom if denom not in (None, 0.0) else ""
+            )
+            w.writerow({k: fmt(row.get(k, "")) for k in fields})
+
+    # Pairwise differences, always A - B in the user-specified selection order.
+    pair_fields = ["structure_A", "structure_B", "comparison"] + [
+        f"delta_{x.replace(' ', '_')}" for x in EDA_CANONICAL_ORDER
+    ] + [
+        "delta_prep_total_from_cat_plus_sub",
+        "prep_difference_dominant_fragment",
+        "abs_delta_prep_cat", "abs_delta_prep_sub",
+    ]
+    pair_rows = []
+    for a, b in itertools.combinations(selected_names, 2):
+        da, db = eda_data.get(a, {}), eda_data.get(b, {})
+        row = {"structure_A": a, "structure_B": b, "comparison": f"{a} - {b}"}
+        for key in EDA_CANONICAL_ORDER:
+            va, vb = da.get(key), db.get(key)
+            row[f"delta_{key.replace(' ', '_')}"] = (
+                va - vb if va is not None and vb is not None else ""
+            )
+        dcat = (da.get("prep_cat") - db.get("prep_cat")
+                if da.get("prep_cat") is not None and db.get("prep_cat") is not None else None)
+        dsub = (da.get("prep_sub") - db.get("prep_sub")
+                if da.get("prep_sub") is not None and db.get("prep_sub") is not None else None)
+        row["delta_prep_cat"] = "" if dcat is None else dcat
+        row["delta_prep_sub"] = "" if dsub is None else dsub
+        row["delta_prep_total_from_cat_plus_sub"] = (
+            "" if dcat is None or dsub is None else dcat + dsub
+        )
+        row["prep_difference_dominant_fragment"] = _prep_dominance(dcat, dsub)
+        row["abs_delta_prep_cat"] = "" if dcat is None else abs(dcat)
+        row["abs_delta_prep_sub"] = "" if dsub is None else abs(dsub)
+        pair_rows.append(row)
+
+    with open(EDA_PAIRWISE_OUT, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=pair_fields)
+        w.writeheader()
+        for row in pair_rows:
+            w.writerow({k: fmt(row.get(k, "")) for k in pair_fields})
+
+    # A compact distortion-only table for quick reading.
+    dist_fields = [
+        "scope", "structure_A", "structure_B", "value_cat", "value_sub",
+        "value_total", "dominant_fragment_by_absolute_magnitude", "definition",
+    ]
+    dist_rows = []
+    for name in selected_names:
+        d = eda_data.get(name, {})
+        cat, sub = d.get("prep_cat"), d.get("prep_sub")
+        total = d.get("preparation")
+        if total is None and cat is not None and sub is not None:
+            total = cat + sub
+        dist_rows.append({
+            "scope": "absolute_structure",
+            "structure_A": name,
+            "structure_B": "",
+            "value_cat": "" if cat is None else cat,
+            "value_sub": "" if sub is None else sub,
+            "value_total": "" if total is None else total,
+            "dominant_fragment_by_absolute_magnitude": _prep_dominance(cat, sub),
+            "definition": "absolute preparation/distortion energy for this structure",
+        })
+    for row in pair_rows:
+        dcat = _to_float(row["delta_prep_cat"])
+        dsub = _to_float(row["delta_prep_sub"])
+        dist_rows.append({
+            "scope": "pairwise_A_minus_B",
+            "structure_A": row["structure_A"],
+            "structure_B": row["structure_B"],
+            "value_cat": "" if dcat is None else dcat,
+            "value_sub": "" if dsub is None else dsub,
+            "value_total": "" if dcat is None or dsub is None else dcat + dsub,
+            "dominant_fragment_by_absolute_magnitude": _prep_dominance(dcat, dsub),
+            "definition": "A-B preparation difference; dominance compares |delta cat| vs |delta sub|",
+        })
+    with open(DISTORTION_SUMMARY_OUT, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=dist_fields)
+        w.writeheader()
+        for row in dist_rows:
+            w.writerow({k: fmt(row.get(k, "")) for k in dist_fields})
+
+    return pair_rows
+
+
+def add_eda_and_isolated_metrics_to_model_rows(model_rows, eda_data, isolated_metrics):
+    for row in model_rows:
+        name = row["structure"]
+        for key, value in isolated_metrics.get(name, {}).items():
+            row[key] = value
+        for key, value in eda_data.get(name, {}).items():
+            row[f"EDA_{key.replace(' ', '_')}"] = value
+        cat = eda_data.get(name, {}).get("prep_cat")
+        sub = eda_data.get(name, {}).get("prep_sub")
+        row["EDA_prep_dominant_fragment"] = _prep_dominance(cat, sub)
+
+    # Rewrite the main model table after augmentation.
+    fields, seen = [], set()
+    for row in model_rows:
+        for k in row:
+            if k not in seen:
+                seen.add(k); fields.append(k)
+    with open(MODEL_OUT, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for row in model_rows:
+            w.writerow({k: fmt(row.get(k, "")) for k in fields})
+
+
+def write_isolated_rmsd_summary(selected_names, isolated_metrics, eda_data):
+    fields = [
+        "structure", "cat_isolated_ref_heavy_RMSD_A", "sub_isolated_ref_heavy_RMSD_A",
+        "cat_isolated_ref_FeN4_core_fit_RMSD_A", "prep_cat", "prep_sub", "preparation",
+        "prep_dominant_fragment",
+    ]
+    with open(ISOLATED_RMSD_OUT, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for name in selected_names:
+            d = {"structure": name, **isolated_metrics.get(name, {})}
+            e = eda_data.get(name, {})
+            for k in ("prep_cat", "prep_sub", "preparation"):
+                d[k] = e.get(k, "")
+            d["prep_dominant_fragment"] = _prep_dominance(e.get("prep_cat"), e.get("prep_sub"))
+            w.writerow({k: fmt(d.get(k, "")) for k in fields})
+
+
+def _read_csv_rows(path):
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        return list(csv.DictReader(f))
+
+
+def write_comparison_report(selected_names, eda_data, pair_rows):
+    cat_rows = _read_csv_rows(CAT_ATOM_DISP_OUT)
+    sub_rows = _read_csv_rows(SUB_ATOM_DISP_OUT)
+    by_cat = {name: [] for name in selected_names}
+    by_sub = {name: [] for name in selected_names}
+    for r in cat_rows:
+        if r.get("structure") in by_cat:
+            by_cat[r["structure"]].append(r)
+    for r in sub_rows:
+        if r.get("structure") in by_sub:
+            by_sub[r["structure"]].append(r)
+
+    with open(COMPARISON_REPORT_OUT, "w", encoding="utf-8") as f:
+        f.write("V12.5 comparison report\n")
+        f.write("=" * 80 + "\n")
+        f.write("Selected structures: " + ", ".join(selected_names) + "\n")
+        f.write(f"Atom deformation references: catalyst={CAT_REFERENCE_XYZ}; substrate={SUB_REFERENCE_XYZ}\n")
+        f.write("IMPORTANT: atom ranks below are TS-vs-isolated-fragment, never TS-vs-TS.\n\n")
+
+        f.write("ABSOLUTE PREPARATION / DISTORTION\n")
+        for name in selected_names:
+            d = eda_data.get(name, {})
+            cat, sub = d.get("prep_cat"), d.get("prep_sub")
+            f.write(
+                f"  {name}: prep_cat={cat if cat is not None else 'NA'}, "
+                f"prep_sub={sub if sub is not None else 'NA'}, "
+                f"dominant={_prep_dominance(cat, sub)}\n"
+            )
+        f.write("\nPAIRWISE PREPARATION DIFFERENCE (A-B)\n")
+        for r in pair_rows:
+            f.write(
+                f"  {r['comparison']}: delta_cat={r['delta_prep_cat']}, "
+                f"delta_sub={r['delta_prep_sub']}, "
+                f"dominant={r['prep_difference_dominant_fragment']}\n"
+            )
+
+        f.write("\nTOP CATALYST ATOM DEFORMATIONS VS ISOLATED caT.XYZ\n")
+        for name in selected_names:
+            rows = sorted(
+                by_cat[name],
+                key=lambda r: int(r.get("rank_by_isolated_cat_allheavy_displacement") or 999999)
+            )[:DEFORMATION_TOP_N]
+            f.write(f"  [{name}]\n")
+            for r in rows:
+                f.write(
+                    f"    rank {r['rank_by_isolated_cat_allheavy_displacement']}: "
+                    f"{r['element']}{r['reference_atom']} -> TS atom {r['mapped_TS_atom']}, "
+                    f"d={r['displacement_after_isolated_cat_allheavy_fit_A']} A, "
+                    f"RMSD2%={r['contribution_to_isolated_cat_RMSD2_pct']}\n"
+                )
+
+        f.write("\nTOP SUBSTRATE ATOM DEFORMATIONS VS ISOLATED sub.xyz\n")
+        for name in selected_names:
+            rows = sorted(
+                by_sub[name],
+                key=lambda r: int(r.get("rank_by_isolated_sub_displacement") or 999999)
+            )[:DEFORMATION_TOP_N]
+            f.write(f"  [{name}]\n")
+            for r in rows:
+                f.write(
+                    f"    rank {r['rank_by_isolated_sub_displacement']}: "
+                    f"{r['element']}{r['reference_atom']} -> TS atom {r['mapped_TS_atom']}, "
+                    f"d={r['internal_displacement_vs_isolated_sub_A']} A, "
+                    f"RMSD2%={r['contribution_to_isolated_sub_RMSD2_pct']}\n"
+                )
+
+
+
+# ============================================================
+# V12.5 CHINESE DESCRIPTOR DICTIONARY + INTEGRATED REPORT
+# ============================================================
+
+def _descriptor_prefix_cn(prefix):
+    mapping = {
+        "subheavy_ligall": "底物重原子–全部配体原子",
+        "suball_ligall": "底物全部原子–全部配体原子",
+        "subheavy_secondaryO": "底物重原子–次级反应氧",
+        "suball_secondaryO": "底物全部原子–次级反应氧",
+        "secondaryO_to_H": "次级反应氧–底物H",
+        "secondaryO_to_C": "次级反应氧–底物C",
+        "secondaryO_to_N": "次级反应氧–底物N",
+        "secondaryO_to_other": "次级反应氧–底物其他元素",
+    }
+    if prefix in mapping:
+        return mapping[prefix]
+    if prefix.startswith("quinoline_Me_CH3_to_subheavy"):
+        return "quinoline-Me甲基–底物重原子"
+    if prefix.startswith("quinoline_Me_CH3_to_suball"):
+        return "quinoline-Me甲基–底物全部原子"
+    if prefix.startswith("quinoline_Me_CH3_to_phenylC"):
+        return "quinoline-Me甲基–底物苯环C"
+    if prefix.startswith("pyridine_Me_CH3_to_subheavy"):
+        return "pyridine-Me甲基–底物重原子"
+    if prefix.startswith("pyridine_Me_CH3_to_suball"):
+        return "pyridine-Me甲基–底物全部原子"
+    if prefix.startswith("pyridine_Me_CH3_to_phenylC"):
+        return "pyridine-Me甲基–底物苯环C"
+    return prefix
+
+
+def descriptor_annotation_cn(field):
+    """Return (category, unit, Chinese annotation, caution) for every model descriptor."""
+    direct = {
+        "structure": ("基本信息", "", "结构名称。", ""),
+        "mechanism": ("基本信息", "", "机理标签：concerted 或 stepwise。", ""),
+        "stereo": ("基本信息", "", "该结构对应的R/S立体化学标签。", ""),
+        "mapping_distance_matrix_RMS_A": ("原子映射", "Å", "底物重原子内部距离矩阵的映射评分，用于选择原子对应关系。", "这不是Kabsch结构RMSD。"),
+        "n_graph_mappings": ("原子映射", "count", "满足底物重原子图连接关系的合法映射数量。", "多个映射通常来自对称性。"),
+        "forming_ref_C1": ("反应坐标", "atom index", "mapping reference中第一个成键碳的原子编号。", ""),
+        "forming_ref_C2": ("反应坐标", "atom index", "mapping reference中第二个成键碳的原子编号。", ""),
+        "forming_mapped_C1": ("反应坐标", "atom index", "当前结构中与forming_ref_C1对应的成键碳编号。", ""),
+        "forming_mapped_C2": ("反应坐标", "atom index", "当前结构中与forming_ref_C2对应的成键碳编号。", ""),
+        "forming_O_on_C1": ("反应坐标", "atom index", "分配给第一个成键碳的反应氧编号。", "若O63/O64化学不等价应手动固定配对。"),
+        "forming_O_on_C2": ("反应坐标", "atom index", "分配给第二个成键碳的反应氧编号。", "若O63/O64化学不等价应手动固定配对。"),
+        "forming_C1O_distance_A": ("反应坐标", "Å", "第一个指定成键C–O距离。", ""),
+        "forming_C2O_distance_A": ("反应坐标", "Å", "第二个指定成键C–O距离。", ""),
+        "forming_pairing_mode": ("反应坐标", "", "两条成键C–O的氧/碳配对方式。", ""),
+        "pairing_swapped": ("反应坐标", "0/1", "当前结构是否相对默认O顺序发生了成键配对交换。", ""),
+        "CO_short_A": ("反应坐标", "Å", "两条成键C–O距离中的较短值。", ""),
+        "CO_long_A": ("反应坐标", "Å", "两条成键C–O距离中的较长值。", ""),
+        "CO_mean_A": ("反应坐标", "Å", "两条成键C–O距离的平均值，表征总体反应进程。", "不同机理之间比较时仍需注意TS位置不同。"),
+        "CO_sum_A": ("反应坐标", "Å", "两条成键C–O距离之和。", ""),
+        "CO_asym_A": ("反应坐标", "Å", "CO_long − CO_short，表征两条成键的不同步程度。", ""),
+        "OCCO_dihedral_signed_deg": ("反应坐标", "deg", "O–C–C–O有符号二面角。", "符号依赖原子顺序。"),
+        "OCCO_dihedral_abs_deg": ("反应坐标", "deg", "O–C–C–O二面角绝对值。", ""),
+        "OCCO_twist_from_coplanar_deg": ("反应坐标", "deg", "O–C–C–O相对于共平面的扭曲程度，0°表示最接近共平面。", ""),
+        "phenyl_ring_mapped_atoms": ("苯环定位", "atom indices", "当前结构中被识别为底物苯环的6个碳原子编号。", ""),
+        "phenyl_centroid_x_A": ("苯环定位", "Å", "底物苯环几何中心的x坐标。", "绝对坐标依赖当前坐标系，单独物理意义有限。"),
+        "phenyl_centroid_y_A": ("苯环定位", "Å", "底物苯环几何中心的y坐标。", "绝对坐标依赖当前坐标系，单独物理意义有限。"),
+        "phenyl_centroid_z_A": ("苯环定位", "Å", "底物苯环几何中心的z坐标。", "绝对坐标依赖当前坐标系，单独物理意义有限。"),
+        "cat_FeLig_heavy_internal_RMSD_A": ("RMSD/构象", "Å", "Fe+配体重原子相对mapping reference独立Kabsch叠合后的内部RMSD。", "这是跨TS构象差异，不是相对孤立fragment的畸变。"),
+        "cat_FeLigO_heavy_internal_RMSD_A": ("RMSD/构象", "Å", "Fe+配体重原子+两个反应氧相对mapping reference独立叠合后的RMSD。", "这是跨TS构象差异。"),
+        "substrate_heavy_internal_RMSD_A": ("RMSD/构象", "Å", "底物重原子相对mapping reference独立叠合后的内部RMSD。", "这是跨TS构象差异。"),
+        "substrate_heavy_pose_RMSD_after_FeLig_alignment_A": ("RMSD/构象", "Å", "仅用Fe+配体重原子叠合后，底物重原子相对mapping reference的RMSD；反映底物在口袋中的位置/姿态变化。", "包含刚体位移与取向变化，不等同底物内部畸变。"),
+        "phenyl_ring_pose_RMSD_after_FeLig_alignment_A": ("RMSD/构象", "Å", "仅用Fe+配体叠合后，底物苯环相对mapping reference的pose RMSD。", "反映苯环在口袋中的位置/取向变化。"),
+        "cat_isolated_ref_heavy_RMSD_A": ("畸变几何", "Å", "当前TS催化剂重原子相对孤立cat.xyz最佳叠合后的RMSD。", "可与prep_cat关联，但RMSD不是能量分解。"),
+        "sub_isolated_ref_heavy_RMSD_A": ("畸变几何", "Å", "当前TS底物重原子相对孤立sub.xyz最佳叠合后的RMSD。", "可与prep_sub关联，但RMSD不是能量分解。"),
+        "cat_isolated_ref_FeN4_core_fit_RMSD_A": ("畸变几何", "Å", "以孤立催化剂Fe+N4核心为对齐核心得到的核心拟合RMSD。", "用于定位外围配体相对核心的形变。"),
+        "isolated_sub_to_mapping_ref_Kabsch_RMSD_A": ("原子映射", "Å", "孤立底物自动graph mapping到mapping-reference TS后，所选映射的Kabsch RMSD。", "用于检查底物原子对应关系。"),
+        "isolated_sub_n_valid_graph_mappings": ("原子映射", "count", "孤立底物到mapping-reference TS的合法重原子graph mapping数量。", ""),
+        "phenyl_contact_group_atoms": ("苯环-配体界面", "atom indices", "用于苯环–配体接触面积分析的底物苯基原子集合；默认包括苯环C及其连接H。", ""),
+        "phenyl_contact_group_n_atoms": ("苯环-配体界面", "count", "苯环接触组中的原子数量。", ""),
+        "phenyl_ligand_min_distance_A": ("苯环-配体界面", "Å", "苯环接触组与配体之间的最短原子间距离。", ""),
+        "phenyl_ligand_min_vdw_gap_A": ("苯环-配体界面", "Å", "苯环接触组–配体的最小vdW gap = d−r_vdW,1−r_vdW,2。", "负值仅表示几何vdW球重叠，不自动等于排斥。"),
+        "phenyl_ligand_vdw_overlap_sum_A": ("苯环-配体界面", "Å", "苯环接触组–配体所有负vdW gap的重叠深度总和。", "这是几何量，不是能量。"),
+        "phenyl_ligand_phenyl_buried_SASA_A2": ("苯环-配体界面", "Å²", "因配体遮蔽而从底物苯基一侧埋藏的SASA。", "几何界面面积，不直接等于相互作用能。"),
+        "phenyl_ligand_ligand_buried_SASA_A2": ("苯环-配体界面", "Å²", "因底物苯基遮蔽而从配体一侧埋藏的SASA。", "几何界面面积。"),
+        "phenyl_ligand_BSA_total_A2": ("苯环-配体界面", "Å²", "苯基侧buried SASA + 配体侧buried SASA。", "几何界面面积。"),
+        "phenyl_ligand_interface_area_halfBSA_A2": ("苯环-配体界面", "Å²", "0.5×总BSA，作为单一界面接触面积的近似。", "几何描述符，不是EDA能量。"),
+        "EDA_Bond_Energy": ("EDA能量", "kcal/mol", "EDA表中的Bond Energy原始值。", "按原始EDA表直接复制，不在脚本中重新定义其组成。"),
+        "EDA_Orbital_Energy": ("EDA能量", "kcal/mol", "EDA中的轨道相互作用能。", "数值符号按原始EDA定义解释。"),
+        "EDA_Electrostatic_Energy": ("EDA能量", "kcal/mol", "EDA中的静电相互作用能。", ""),
+        "EDA_Pauli_Energy": ("EDA能量", "kcal/mol", "EDA中的Pauli项。", "不要把单一几何overlap直接等同于该能量。"),
+        "EDA_Delta_E^0(XC)": ("EDA能量", "kcal/mol", "EDA表中的Delta E^0(XC)原始项。", "按原始输出定义使用。"),
+        "EDA_Delta_Dispersion": ("EDA能量", "kcal/mol", "EDA中的色散项。", ""),
+        "EDA_Delta_G_sol": ("EDA能量", "kcal/mol", "EDA表中的溶液相自由能/势垒列（沿用输入表命名）。", "脚本只复制，不重新计算。"),
+        "EDA_prep_cat": ("畸变能", "kcal/mol", "催化剂fragment的preparation/distortion energy。", "来自用户提供的EDA/畸变能表。"),
+        "EDA_prep_sub": ("畸变能", "kcal/mol", "底物fragment的preparation/distortion energy。", "来自用户提供的EDA/畸变能表。"),
+        "EDA_preparation": ("畸变能", "kcal/mol", "总preparation/distortion energy。", "若输入表没有该列，可由prep_cat+prep_sub用于核对。"),
+        "EDA_prep_dominant_fragment": ("畸变能", "", "该结构中按绝对数值比较，催化剂或底物哪一部分preparation更大。", "只比较大小，不代表原子级能量贡献。"),
+    }
+    if field in direct:
+        return direct[field]
+
+    # Generic contact-summary descriptors.
+    m = re.match(r"(.+?)_(min_distance_A|min_vdw_gap_A|vdw_overlap_sum_A|n_vdw_overlap|n_proximity_gap_le_[0-9.]+A)$", field)
+    if m:
+        prefix, metric = m.groups()
+        pcn = _descriptor_prefix_cn(prefix)
+        if metric == "min_distance_A":
+            return ("接触分析", "Å", f"{pcn}接触集合中的最短原子间距离。", "")
+        if metric == "min_vdw_gap_A":
+            return ("接触分析", "Å", f"{pcn}接触集合中的最小vdW gap。", "负值表示几何vdW球重叠，不自动等于排斥能。")
+        if metric == "vdw_overlap_sum_A":
+            return ("接触分析", "Å", f"{pcn}所有负vdW gap的重叠深度总和。", "仅为几何接触指标。")
+        if metric == "n_vdw_overlap":
+            return ("接触分析", "count", f"{pcn}中vdW gap<0的原子对数量。", "仅为几何计数。")
+        return ("接触分析", "count", f"{pcn}中vdW gap不大于设定proximity阈值的原子对数量。", "阈值是操作性定义，不是能量阈值。")
+
+    # Named methyl descriptors.
+    for label, cn in (("quinoline_Me", "quinoline-Me甲基"), ("pyridine_Me", "pyridine-Me甲基")):
+        if field.startswith(label + "_"):
+            tail = field[len(label)+1:]
+            simple = {
+                "methylC_index": ("atom index", f"{cn}的甲基碳在当前结构中的原子编号。"),
+                "anchor_index": ("atom index", f"{cn}连接的配体重原子编号。"),
+                "methylC_to_forming_C1_A": ("Å", f"{cn}碳到第一个成键碳的距离。"),
+                "methylC_to_forming_C2_A": ("Å", f"{cn}碳到第二个成键碳的距离。"),
+                "methylC_to_forming_CC_midpoint_A": ("Å", f"{cn}碳到两个成键碳中点的距离。"),
+                "methylC_to_subheavy_centroid_A": ("Å", f"{cn}碳到底物重原子几何中心的距离。"),
+                "methylC_to_phenyl_centroid_A": ("Å", f"{cn}碳到底物苯环几何中心的距离。"),
+                "methylC_abs_distance_to_phenyl_plane_A": ("Å", f"{cn}碳到底物苯环平面的绝对垂直距离。"),
+                "closest_substrate_atom": ("atom index", f"与{cn}最近的底物原子编号。"),
+                "closest_substrate_element": ("element", f"与{cn}最近的底物原子元素。"),
+                "closest_methyl_atom": ("atom index", f"产生最近接触的{cn}内部原子编号。"),
+                "closest_distance_A": ("Å", f"{cn}与底物最近原子对的距离。"),
+                "closest_vdw_gap_A": ("Å", f"{cn}与底物最近原子对的vdW gap。"),
+            }
+            if tail in simple:
+                unit, desc = simple[tail]
+                return ("局部手性口袋", unit, desc, "")
+
+    if field.startswith("methylpair_"):
+        tail = field[len("methylpair_"):]
+        d = {
+            "methyl_pair_label_A": ("", "甲基轴A端标签；默认quinoline_Me。"),
+            "methyl_pair_label_B": ("", "甲基轴B端标签；默认pyridine_Me。"),
+            "methylC_pair_distance_A": ("Å", "两个指定配体甲基碳之间的距离。"),
+            "rxn_midpoint_distance_to_A_A": ("Å", "反应中心C–C中点到甲基A端的距离。"),
+            "rxn_midpoint_distance_to_B_A": ("Å", "反应中心C–C中点到甲基B端的距离。"),
+            "rxn_midpoint_distance_bias_AminusB_A": ("Å", "反应中心到A端距离减到B端距离；符号反映更靠近哪一端。"),
+            "rxn_midpoint_signed_shift_A_to_B_A": ("Å", "反应中心沿A→B甲基轴的有符号位移；正值朝B端。"),
+            "rxn_midpoint_perp_distance_to_methyl_axis_A": ("Å", "反应中心到两甲基碳连线的垂直距离。"),
+            "phenyl_centroid_distance_to_A_A": ("Å", "底物苯环中心到甲基A端的距离。"),
+            "phenyl_centroid_distance_to_B_A": ("Å", "底物苯环中心到甲基B端的距离。"),
+            "phenyl_centroid_distance_bias_AminusB_A": ("Å", "苯环中心到A端距离减到B端距离。"),
+            "phenyl_centroid_signed_shift_A_to_B_A": ("Å", "苯环中心沿A→B甲基轴的有符号位移；正值朝B端。"),
+            "phenyl_centroid_perp_distance_to_methyl_axis_A": ("Å", "苯环中心到甲基轴的垂直距离。"),
+            "methyl_axis_angle_to_phenyl_plane_deg": ("deg", "甲基A→B轴与底物苯环平面的夹角。"),
+            "substrate_heavy_centroid_signed_shift_A_to_B_A": ("Å", "底物重原子中心沿A→B甲基轴的有符号位移。"),
+            "substrate_heavy_centroid_perp_distance_to_methyl_axis_A": ("Å", "底物重原子中心到甲基轴的垂直距离。"),
+        }
+        if tail in d:
+            unit, desc = d[tail]
+            return ("局部手性口袋", unit, desc, "")
+
+    m = re.match(r"G(\d+)_subheavy_size", field)
+    if m:
+        return ("底物分组接触", "count", f"底物对称性组G{m.group(1)}中重原子的数量。", "")
+    m = re.match(r"G(\d+)_suball_size", field)
+    if m:
+        return ("底物分组接触", "count", f"底物对称性组G{m.group(1)}中包含分配H后的原子数量。", "")
+    m = re.match(r"G(\d+)_(subheavy|suball)_ligall_vdw_overlap_(sum|per_subatom)_A", field)
+    if m:
+        gid, scope, agg = m.groups()
+        scn = "重原子" if scope == "subheavy" else "全部原子"
+        acn = "vdW重叠深度总和" if agg == "sum" else "每个底物原子归一化的vdW重叠深度"
+        return ("底物分组接触", "Å", f"G{gid}的{scn}与全部配体之间的{acn}。", "几何量，不是能量。")
+    m = re.match(r"G(\d+)_O_any_min_distance_including_primary_A", field)
+    if m:
+        return ("底物分组接触", "Å", f"G{m.group(1)}中任一原子到两个反应氧的最短距离；包括primary成键C–O。", "不能当作纯secondary contact。")
+
+    if field.startswith("EDA_"):
+        return ("EDA/畸变能", "", f"从EDA输入表复制的字段：{field[4:]}。", "脚本不改变该项定义。")
+
+    # Final non-empty fallback so every column has a Chinese note.
+    unit = ""
+    if field.endswith("_A2"):
+        unit = "Å²"
+    elif field.endswith("_A"):
+        unit = "Å"
+    elif field.endswith("_deg"):
+        unit = "deg"
+    return ("其他描述符", unit, f"脚本生成的描述符“{field}”；其具体含义由字段名对应的几何/映射定义给出。", "建议优先结合descriptor字典中的同类字段与脚本定义使用。")
+
+
+def write_descriptor_chinese_dictionary(model_rows):
+    fields = []
+    seen = set()
+    for row in model_rows:
+        for k in row:
+            if k not in seen:
+                seen.add(k); fields.append(k)
+    out_fields = ["descriptor", "category_cn", "unit", "chinese_annotation", "caution_cn"]
+    with open(DESCRIPTOR_CN_OUT, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=out_fields)
+        w.writeheader()
+        for field in fields:
+            cat, unit, desc, caution = descriptor_annotation_cn(field)
+            w.writerow({
+                "descriptor": field,
+                "category_cn": cat,
+                "unit": unit,
+                "chinese_annotation": desc,
+                "caution_cn": caution,
+            })
+
+
+def _numeric_or_none(v):
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        if isinstance(v, float) and math.isnan(v):
+            return None
+        return float(v)
+    return _to_float(v)
+
+
+def write_pairwise_descriptor_differences(selected_names, model_rows):
+    by_name = {r["structure"]: r for r in model_rows}
+    all_fields = []
+    seen = set()
+    for r in model_rows:
+        for k in r:
+            if k not in seen:
+                seen.add(k); all_fields.append(k)
+    out_fields = [
+        "comparison", "structure_A", "structure_B", "category_cn", "descriptor",
+        "unit", "chinese_annotation", "A_value", "B_value", "delta_A_minus_B", "caution_cn",
+    ]
+    rows = []
+    for a, b in itertools.combinations(selected_names, 2):
+        ra, rb = by_name[a], by_name[b]
+        for field in all_fields:
+            va = _numeric_or_none(ra.get(field))
+            vb = _numeric_or_none(rb.get(field))
+            if va is None or vb is None:
+                continue
+            cat, unit, desc, caution = descriptor_annotation_cn(field)
+            rows.append({
+                "comparison": f"{a} - {b}", "structure_A": a, "structure_B": b,
+                "category_cn": cat, "descriptor": field, "unit": unit,
+                "chinese_annotation": desc, "A_value": va, "B_value": vb,
+                "delta_A_minus_B": va-vb, "caution_cn": caution,
+            })
+    with open(PAIRWISE_DESCRIPTOR_OUT, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=out_fields)
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: fmt(r.get(k, "")) for k in out_fields})
+
+
+def _sasa_per_atom(atoms, group_indices, environment_indices):
+    """Same SASA definition as sasa_of_group, but return one value per group atom."""
+    ad = atom_dict(atoms)
+    group_indices = list(dict.fromkeys(group_indices))
+    environment_indices = list(dict.fromkeys(environment_indices))
+    unit_pts = _sasa_unit_points()
+    out = {}
+    for i in group_indices:
+        ai = ad[i]
+        ri = VDW[ai["element"]] + SASA_PROBE_A
+        occluders = []
+        for j in environment_indices:
+            if j == i:
+                continue
+            aj = ad[j]
+            rj = VDW[aj["element"]] + SASA_PROBE_A
+            dij = distance(ai, aj)
+            if dij < ri + rj:
+                occluders.append((aj, rj*rj))
+        accessible = 0
+        for u in unit_pts:
+            p = (ai["x"] + ri*u[0], ai["y"] + ri*u[1], ai["z"] + ri*u[2])
+            blocked = False
+            for aj, rj2 in occluders:
+                dx = p[0]-aj["x"]; dy = p[1]-aj["y"]; dz = p[2]-aj["z"]
+                if dx*dx + dy*dy + dz*dz < rj2:
+                    blocked = True; break
+            if not blocked:
+                accessible += 1
+        out[i] = (accessible / SASA_N_POINTS) * (4.0 * math.pi * ri * ri)
+    return out
+
+
+def write_bsa_atom_contributions(structures, mappings, phenyl_ring_ref):
+    fields = [
+        "structure", "side", "atom", "element", "buried_SASA_contribution_A2",
+        "fraction_of_side_buried_SASA_pct", "rank_within_side",
+    ]
+    rows = []
+    for name, atoms in structures.items():
+        ad = atom_dict(atoms)
+        phenyl_ring_indices = mapped_ring_indices(mappings[name], phenyl_ring_ref)
+        phenyl_ids = phenyl_group_indices_with_H(atoms, phenyl_ring_indices)
+        lig_ids = [a["index"] for a in ligand_atoms(atoms)]
+        combined = phenyl_ids + lig_ids
+
+        ph_alone = _sasa_per_atom(atoms, phenyl_ids, phenyl_ids)
+        ph_with = _sasa_per_atom(atoms, phenyl_ids, combined)
+        lig_alone = _sasa_per_atom(atoms, lig_ids, lig_ids)
+        lig_with = _sasa_per_atom(atoms, lig_ids, combined)
+        for side, ids, alone, with_other in (
+            ("phenyl", phenyl_ids, ph_alone, ph_with),
+            ("ligand", lig_ids, lig_alone, lig_with),
+        ):
+            vals = {i: max(0.0, alone[i]-with_other[i]) for i in ids}
+            total = sum(vals.values())
+            ranked = sorted(ids, key=lambda i: (-vals[i], i))
+            rank = {i: n+1 for n, i in enumerate(ranked)}
+            for i in ids:
+                rows.append({
+                    "structure": name, "side": side, "atom": i,
+                    "element": ad[i]["element"],
+                    "buried_SASA_contribution_A2": vals[i],
+                    "fraction_of_side_buried_SASA_pct": (100.0*vals[i]/total if total > 1e-30 else 0.0),
+                    "rank_within_side": rank[i],
+                })
+    with open(BSA_ATOM_CONTRIB_OUT, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: fmt(r.get(k, "")) for k in fields})
+    return rows
+
+
+def _top_contact_rows(path, selected_names, atom1, atom2, topn=REPORT_TOP_CONTACTS):
+    rows = _read_csv_rows(path)
+    out = {n: [] for n in selected_names}
+    for n in selected_names:
+        rr = [r for r in rows if r.get("structure") == n]
+        rr.sort(key=lambda r: (-(_to_float(r.get("vdw_overlap_depth_A")) or 0.0),
+                               (_to_float(r.get("distance_A")) or 999.0)))
+        # Prefer actual overlap rows. If none, retain nearest contacts.
+        pos = [r for r in rr if (_to_float(r.get("vdw_overlap_depth_A")) or 0.0) > 0]
+        out[n] = (pos if pos else sorted(rr, key=lambda r: _to_float(r.get("distance_A")) or 999.0))[:topn]
+    return out
+
+
+def _pairwise_atom_deformation_deltas(cat_rows, sub_rows, a, b, topn=REPORT_TOP_ATOMS):
+    def calc(rows, dfield, pctfield):
+        aa = {int(r["reference_atom"]): r for r in rows if r.get("structure") == a}
+        bb = {int(r["reference_atom"]): r for r in rows if r.get("structure") == b}
+        vals = []
+        for idx in sorted(set(aa) & set(bb)):
+            da = _to_float(aa[idx].get(dfield)) or 0.0
+            db = _to_float(bb[idx].get(dfield)) or 0.0
+            vals.append((abs(da*da-db*db), idx, aa[idx].get("element", ""), da, db,
+                         da*da-db*db,
+                         _to_float(aa[idx].get(pctfield)), _to_float(bb[idx].get(pctfield))))
+        vals.sort(reverse=True)
+        return vals[:topn]
+    return (
+        calc(cat_rows, "displacement_after_isolated_cat_allheavy_fit_A", "contribution_to_isolated_cat_RMSD2_pct"),
+        calc(sub_rows, "internal_displacement_vs_isolated_sub_A", "contribution_to_isolated_sub_RMSD2_pct"),
+    )
+
+
+def _fmt_num(x, nd=3):
+    v = _numeric_or_none(x)
+    return "NA" if v is None else f"{v:.{nd}f}"
+
+
+def write_comprehensive_report_v12_5(selected_names, model_rows, eda_data, pair_rows,
+                                      structures, mappings, phenyl_ring_ref):
+    """Human-readable report: geometry/contact, EDA, distortion, and atom localization."""
+    by_model = {r["structure"]: r for r in model_rows}
+    cat_rows = _read_csv_rows(CAT_ATOM_DISP_OUT)
+    sub_rows = _read_csv_rows(SUB_ATOM_DISP_OUT)
+    bsa_rows = write_bsa_atom_contributions(structures, mappings, phenyl_ring_ref)
+    lig_top = _top_contact_rows(LIGAND_LONG_OUT, selected_names, "substrate_atom", "ligand_atom")
+    oxy_top = _top_contact_rows(SECONDARY_O_LONG_OUT, selected_names, "substrate_atom", "oxygen_atom")
+
+    bsa_by = {(n, side): [] for n in selected_names for side in ("phenyl", "ligand")}
+    for r in bsa_rows:
+        key = (r["structure"], r["side"])
+        if key in bsa_by:
+            bsa_by[key].append(r)
+    for key in bsa_by:
+        bsa_by[key].sort(key=lambda r: int(r["rank_within_side"]))
+
+    geom_fields = [
+        "CO_short_A", "CO_long_A", "CO_mean_A", "CO_asym_A",
+        "OCCO_twist_from_coplanar_deg",
+        "cat_isolated_ref_heavy_RMSD_A", "sub_isolated_ref_heavy_RMSD_A",
+        "substrate_heavy_pose_RMSD_after_FeLig_alignment_A",
+        "phenyl_ring_pose_RMSD_after_FeLig_alignment_A",
+    ]
+    contact_fields = [
+        "subheavy_ligall_min_distance_A", "subheavy_ligall_min_vdw_gap_A",
+        "subheavy_ligall_vdw_overlap_sum_A", "suball_ligall_vdw_overlap_sum_A",
+        "suball_secondaryO_vdw_overlap_sum_A",
+        "secondaryO_to_H_vdw_overlap_sum_A", "secondaryO_to_C_vdw_overlap_sum_A",
+        "secondaryO_to_N_vdw_overlap_sum_A",
+        "phenyl_ligand_min_distance_A", "phenyl_ligand_min_vdw_gap_A",
+        "phenyl_ligand_vdw_overlap_sum_A", "phenyl_ligand_phenyl_buried_SASA_A2",
+        "phenyl_ligand_ligand_buried_SASA_A2", "phenyl_ligand_BSA_total_A2",
+        "phenyl_ligand_interface_area_halfBSA_A2",
+    ]
+
+    with open(COMPARISON_REPORT_OUT, "w", encoding="utf-8") as f:
+        f.write("V12.5 综合比较报告 / Integrated Comparison Report\n")
+        f.write("="*100 + "\n")
+        f.write("比较结构: " + ", ".join(selected_names) + "\n")
+        f.write(f"催化剂畸变参考: {CAT_REFERENCE_XYZ}\n底物畸变参考: {SUB_REFERENCE_XYZ}\nEDA表: {EDA_TABLE}\n")
+        f.write("说明: 原子RMSD²贡献只用于定位几何形变来源，不是原子级畸变能分解。vdW overlap/BSA也是几何接触指标，不自动等于Pauli或其他EDA能量。\n\n")
+
+        f.write("1. EDA ENERGY COMPARISON / EDA能量比较\n")
+        f.write("-"*100 + "\n")
+        for a, b in itertools.combinations(selected_names, 2):
+            f.write(f"[{a} - {b}]  正值表示A比B数值更大\n")
+            da, db = eda_data.get(a, {}), eda_data.get(b, {})
+            for key in EDA_CANONICAL_ORDER:
+                va, vb = da.get(key), db.get(key)
+                if va is None or vb is None:
+                    continue
+                label = EDA_REPORT_LABEL.get(key, key)
+                f.write(f"  {label:24s}  A={va:10.4f}  B={vb:10.4f}  Δ(A-B)={va-vb:+10.4f}\n")
+            f.write("\n")
+
+        f.write("2. DISTORTION / PREPARATION / 畸变能\n")
+        f.write("-"*100 + "\n")
+        for name in selected_names:
+            d = eda_data.get(name, {})
+            cat, sub = d.get("prep_cat"), d.get("prep_sub")
+            total = d.get("preparation")
+            if total is None and cat is not None and sub is not None:
+                total = cat + sub
+            f.write(
+                f"[{name}] ΔEdist_sub={_fmt_num(sub)}  ΔEdist_cat={_fmt_num(cat)}  "
+                f"ΔEdist={_fmt_num(total)}  larger_component={_prep_dominance(cat, sub)}\n"
+            )
+        f.write("\nPairwise difference / 两结构畸变能差值:\n")
+        for r in pair_rows:
+            f.write(
+                f"  {r['comparison']}: Δ(ΔEdist_sub)={_fmt_num(r['delta_prep_sub'])}, "
+                f"Δ(ΔEdist_cat)={_fmt_num(r['delta_prep_cat'])}, "
+                f"Δ(ΔEdist)={_fmt_num(r['delta_prep_total_from_cat_plus_sub'])}, "
+                f"difference_dominated_by={r['prep_difference_dominant_fragment']}\n"
+            )
+
+        f.write("\nTop atom deformations vs isolated fragments / 各结构相对孤立fragment形变最大的原子:\n")
+        for name in selected_names:
+            f.write(f"  [{name}] catalyst:\n")
+            rr = [r for r in cat_rows if r.get("structure") == name]
+            rr.sort(key=lambda r: int(r.get("rank_by_isolated_cat_allheavy_displacement") or 999999))
+            for r in rr[:REPORT_TOP_ATOMS]:
+                f.write(f"    {r['element']}{r['reference_atom']} -> TS{r['mapped_TS_atom']}: d={_fmt_num(r['displacement_after_isolated_cat_allheavy_fit_A'])} Å, RMSD²贡献={_fmt_num(r['contribution_to_isolated_cat_RMSD2_pct'],2)}%\n")
+            f.write(f"  [{name}] substrate:\n")
+            rr = [r for r in sub_rows if r.get("structure") == name]
+            rr.sort(key=lambda r: int(r.get("rank_by_isolated_sub_displacement") or 999999))
+            for r in rr[:REPORT_TOP_ATOMS]:
+                f.write(f"    {r['element']}{r['reference_atom']} -> TS{r['mapped_TS_atom']}: d={_fmt_num(r['internal_displacement_vs_isolated_sub_A'])} Å, RMSD²贡献={_fmt_num(r['contribution_to_isolated_sub_RMSD2_pct'],2)}%\n")
+
+        f.write("\nAtoms that differ most between each pair / 两结构之间几何畸变差异最大的原子（按|d_A²-d_B²|排序）:\n")
+        for a, b in itertools.combinations(selected_names, 2):
+            cvals, svals = _pairwise_atom_deformation_deltas(cat_rows, sub_rows, a, b)
+            f.write(f"  [{a} - {b}] catalyst:\n")
+            for _, idx, el, da, db, dd2, pa, pb in cvals:
+                f.write(f"    {el}{idx}: d_A={da:.3f}, d_B={db:.3f} Å, Δd²={dd2:+.4f} Å², RMSD²% A/B={_fmt_num(pa,2)}/{_fmt_num(pb,2)}\n")
+            f.write(f"  [{a} - {b}] substrate:\n")
+            for _, idx, el, da, db, dd2, pa, pb in svals:
+                f.write(f"    {el}{idx}: d_A={da:.3f}, d_B={db:.3f} Å, Δd²={dd2:+.4f} Å², RMSD²% A/B={_fmt_num(pa,2)}/{_fmt_num(pb,2)}\n")
+        f.write("\n注意: 上述原子是几何畸变差异的来源，不是把prep_cat/prep_sub能量按原子拆分。\n\n")
+
+        f.write("3. GEOMETRIC ANALYSIS / 几何分析\n")
+        f.write("-"*100 + "\n")
+        for a, b in itertools.combinations(selected_names, 2):
+            f.write(f"[{a} - {b}]\n")
+            for field in geom_fields:
+                va = _numeric_or_none(by_model[a].get(field)); vb = _numeric_or_none(by_model[b].get(field))
+                if va is None or vb is None:
+                    continue
+                cat, unit, desc, caution = descriptor_annotation_cn(field)
+                f.write(f"  {field}: A={va:.4f}, B={vb:.4f}, Δ={va-vb:+.4f} {unit}  | {desc}\n")
+            f.write("\n")
+
+        f.write("4. INTERACTION-CONTACT ANALYSIS / 相互作用-接触几何分析\n")
+        f.write("-"*100 + "\n")
+        for a, b in itertools.combinations(selected_names, 2):
+            f.write(f"[{a} - {b}] aggregate descriptors / 总体描述符\n")
+            for field in contact_fields:
+                va = _numeric_or_none(by_model[a].get(field)); vb = _numeric_or_none(by_model[b].get(field))
+                if va is None or vb is None:
+                    continue
+                cat, unit, desc, caution = descriptor_annotation_cn(field)
+                f.write(f"  {field}: A={va:.4f}, B={vb:.4f}, Δ={va-vb:+.4f} {unit}  | {desc}\n")
+            f.write("\n")
+
+        f.write("Top ligand-substrate atom contacts / 配体-底物最强几何接触原子对:\n")
+        for name in selected_names:
+            f.write(f"  [{name}]\n")
+            for r in lig_top[name]:
+                f.write(f"    sub {r['substrate_element']}{r['substrate_atom']} ... lig {r['ligand_element']}{r['ligand_atom']}: d={_fmt_num(r['distance_A'])} Å, gap={_fmt_num(r['vdw_gap_A'])} Å, overlap={_fmt_num(r['vdw_overlap_depth_A'])} Å\n")
+
+        f.write("\nTop secondary-O contacts / 次级O-底物最强几何接触原子对:\n")
+        for name in selected_names:
+            f.write(f"  [{name}]\n")
+            for r in oxy_top[name]:
+                f.write(f"    O{r['oxygen_atom']} ... {r['substrate_element']}{r['substrate_atom']}: d={_fmt_num(r['distance_A'])} Å, gap={_fmt_num(r['vdw_gap_A'])} Å, overlap={_fmt_num(r['vdw_overlap_depth_A'])} Å, class={r.get('contact_class','')}\n")
+
+        f.write("\nPhenyl-ligand buried-SASA atom contributions / 苯环-配体接触面积的原子贡献:\n")
+        for name in selected_names:
+            f.write(f"  [{name}] phenyl side:\n")
+            for r in bsa_by[(name, "phenyl")][:REPORT_TOP_ATOMS]:
+                f.write(f"    {r['element']}{r['atom']}: buried={_fmt_num(r['buried_SASA_contribution_A2'])} Å², side%={_fmt_num(r['fraction_of_side_buried_SASA_pct'],2)}%\n")
+            f.write(f"  [{name}] ligand side:\n")
+            for r in bsa_by[(name, "ligand")][:REPORT_TOP_ATOMS]:
+                f.write(f"    {r['element']}{r['atom']}: buried={_fmt_num(r['buried_SASA_contribution_A2'])} Å², side%={_fmt_num(r['fraction_of_side_buried_SASA_pct'],2)}%\n")
+
+        f.write("\n5. DESCRIPTOR NOTES / 描述符中文注释\n")
+        f.write("-"*100 + "\n")
+        f.write(f"完整逐列中文说明见: {DESCRIPTOR_CN_OUT}\n")
+        f.write(f"所有可数值比较descriptor的A-B差值+中文说明见: {PAIRWISE_DESCRIPTOR_OUT}\n")
+        f.write(f"苯环-配体BSA逐原子贡献见: {BSA_ATOM_CONTRIB_OUT}\n")
+
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description=(
+            "V12.5 geometry/contact + isolated-fragment deformation + EDA + Chinese report. "
+            "Choose two, several, or all structures."
+        )
+    )
+    p.add_argument(
+        "--structures", nargs="+", default=None,
+        help="Exact structure names to compare, e.g. --structures con_S step_R. Default: all."
+    )
+    p.add_argument("--all", action="store_true", help="Analyze all structures in FILES.")
+    p.add_argument("--eda", default=EDA_TABLE, help=f"EDA/preparation CSV (default: {EDA_TABLE})")
+    p.add_argument("--cat-ref", default=CAT_REFERENCE_XYZ,
+                   help=f"isolated catalyst XYZ (default: {CAT_REFERENCE_XYZ})")
+    p.add_argument("--sub-ref", default=SUB_REFERENCE_XYZ,
+                   help=f"isolated substrate XYZ (default: {SUB_REFERENCE_XYZ})")
+    p.add_argument("--outdir", default=None,
+                   help="output directory; default is v12_5_compare_<selected names>")
+    p.add_argument("--list-structures", action="store_true", help="print available names and exit")
+    return p.parse_args()
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    global CAT_REFERENCE_XYZ, SUB_REFERENCE_XYZ, EDA_TABLE
+
+    args = parse_args()
+    if args.list_structures:
+        print("Available structures:")
+        for name, fn in FILES.items():
+            print(f"  {name:12s}  {fn}")
+        return
+
+    if args.all or args.structures is None:
+        selected_names = list(FILES.keys())
+    else:
+        selected_names = args.structures
+    # Preserve user order, remove accidental duplicates.
+    selected_names = list(dict.fromkeys(selected_names))
+    unknown = [x for x in selected_names if x not in FILES]
+    if unknown:
+        raise SystemExit(
+            "Unknown structure(s): " + ", ".join(unknown) +
+            "\nAvailable: " + ", ".join(FILES)
+        )
+    if not selected_names:
+        raise SystemExit("No structures selected")
+
+    start_dir = Path.cwd()
+    CAT_REFERENCE_XYZ = str(Path(args.cat_ref).expanduser().resolve())
+    SUB_REFERENCE_XYZ = str(Path(args.sub_ref).expanduser().resolve())
+    EDA_TABLE = str(Path(args.eda).expanduser().resolve())
+
+    # Load mapping reference even when it is not one of the requested outputs.
+    needed = list(dict.fromkeys(selected_names + [REFERENCE]))
+    working_structures = {}
+    for name in needed:
+        p = Path(FILES[name]).expanduser().resolve()
+        if not p.exists():
+            raise FileNotFoundError(f"Missing XYZ for {name}: {p}")
+        working_structures[name] = read_xyz(str(p))
+
+    for p in (Path(CAT_REFERENCE_XYZ), Path(SUB_REFERENCE_XYZ), Path(EDA_TABLE)):
+        if not p.exists():
+            raise FileNotFoundError(p)
+    cat_ref_atoms = read_xyz(CAT_REFERENCE_XYZ)
+    sub_ref_atoms = read_xyz(SUB_REFERENCE_XYZ)
+    eda_data = parse_eda_table(EDA_TABLE, list(FILES.keys()))
+
+    # Strict check: the current EDA matrix is expected to contain all ten rows
+    # for every selected structure. Do not silently continue to an NA report.
+    required_eda = list(EDA_CANONICAL_ORDER)
+    selected_for_check = selected_names if 'selected_names' in locals() else list(FILES.keys())
+    problems = []
+    for _name in selected_for_check:
+        _missing = [k for k in required_eda if k not in eda_data.get(_name, {})]
+        if _missing:
+            problems.append((_name, _missing))
+    if problems:
+        msg = ["EDA parsing failed: required rows are missing for selected structure(s):"]
+        for _name, _missing in problems:
+            msg.append("  " + _name + ": " + ", ".join(EDA_REPORT_LABEL.get(k, k) for k in _missing))
+        msg.append("Expected row labels include: Bond Energy, Orbital Energy, Electrostatic Energy, Pauli Energy, delta E0XC, deltaEdisp, delta Gsol, delta Edist_sub, deltaEdist_cat, delta Edist")
+        raise RuntimeError("\n".join(msg))
+
+    ref_atoms = working_structures[REFERENCE]
+    groups, nautos = symmetry_groups(ref_atoms)
+
+    # Mapping metadata is generated using the fixed chemical mapping reference.
+    ref_methyl_meta_by_label, methyl_candidates = resolve_methyl_groups(ref_atoms)
+    methyl_meta_working, ligand_mapping_meta, ligand_mappings = \
+        map_named_methyls_to_structures(working_structures, ref_methyl_meta_by_label)
+
+    if FORMING_C_REF is None:
+        forming_c_ref = auto_detect_forming_c_ref(ref_atoms)
+        forming_auto = True
+    else:
+        forming_c_ref = tuple(FORMING_C_REF)
+        forming_auto = False
+
+    ref_graph, _ = build_graph(ref_atoms)
+    mappings = {REFERENCE: {i: i for i in ref_graph}}
+    mapping_meta = {REFERENCE: (0.0, 1)}
+    for name, atoms in working_structures.items():
+        if name == REFERENCE:
+            continue
+        m, score, nmaps = best_mapping(ref_atoms, atoms)
+        mappings[name] = m
+        mapping_meta[name] = (score, nmaps)
+
+    phenyl_ring_ref, phenyl_candidates, phenyl_mode = resolve_phenyl_ring_ref(ref_atoms, forming_c_ref)
+
+    # From here onward, output only the explicitly selected structures.
+    structures = {name: working_structures[name] for name in selected_names}
+    methyl_meta_by_structure = {name: methyl_meta_working[name] for name in selected_names}
+
+    forming_infos = {
+        name: forming_bond_descriptors(atoms, mappings[name], forming_c_ref)
+        for name, atoms in structures.items()
+    }
+    subheavy_results = {
+        name: group_analysis(atoms, mappings[name], groups, forming_infos[name], include_sub_H=False)
+        for name, atoms in structures.items()
+    }
+    suball_results = {
+        name: group_analysis(atoms, mappings[name], groups, forming_infos[name], include_sub_H=True)
+        for name, atoms in structures.items()
+    }
+
+    # Create output directory only after all input files have been resolved/read.
+    if args.outdir:
+        outdir = Path(args.outdir).expanduser().resolve()
+    else:
+        tag = "all" if len(selected_names) == len(FILES) else "__".join(selected_names)
+        outdir = (start_dir / f"v12_5_compare_{tag}").resolve()
+    outdir.mkdir(parents=True, exist_ok=True)
+    os.chdir(outdir)
+
+    # V12.5 retains the full V11 geometry/contact analysis for selected structures.
+    write_symmetry_files(ref_atoms, groups, nautos)
+    write_methyl_candidates(ref_atoms, ref_methyl_meta_by_label, methyl_candidates)
+    write_methyl_mapping_report(methyl_meta_by_structure, {
+        n: ligand_mapping_meta[n] for n in selected_names
+    })
+    write_phenyl_ring_mapping(structures, mappings, phenyl_ring_ref, phenyl_candidates, phenyl_mode)
+
+    with open("mapping_report_v12_5.txt", "w", encoding="utf-8") as report:
+        report.write(f"Mapping reference: {REFERENCE}\n")
+        report.write("Only selected structures are listed below.\n")
+        report.write("Isolated substrate atom order is auto-mapped in V12.5.\n")
+        report.write("Score = RMS difference of mapped substrate heavy-atom internal pair distances; NOT Kabsch RMSD.\n")
+        for name in selected_names:
+            score, nmaps = mapping_meta[name]
+            report.write(f"{name}: {nmaps} mapping(s), distance-matrix RMS = {score:.6f} A\n")
+
+    write_group_table(
+        subheavy_results, GROUPS_SUBHEAVY_OUT,
+        "substrate heavy atoms vs all ligand atoms; secondary O contacts exclude only assigned primary C-O pairs",
+    )
+    write_group_table(
+        suball_results, GROUPS_SUBALL_OUT,
+        "all substrate atoms vs all ligand atoms; secondary O contacts exclude only assigned primary C-O pairs",
+    )
+    write_primary_pairs(structures, forming_infos)
+    write_long_secondary_O_contacts(structures, forming_infos)
+    write_long_ligand_contacts(structures)
+    write_long_methyl_contacts(structures, methyl_meta_by_structure)
+
+    model_rows = write_model_descriptors(
+        structures, mappings, mapping_meta, groups,
+        subheavy_results, suball_results, forming_infos,
+        methyl_meta_by_structure, phenyl_ring_ref, ligand_mappings,
+        ref_atoms,
+    )
+
+    # Atom-resolved deformation is now vs isolated fragments, not another TS.
+    isolated_metrics, deformation_core_ids, deformation_core_mode = isolated_fragment_deformation(
+        structures, mappings, ligand_mappings,
+        ref_atoms, cat_ref_atoms, sub_ref_atoms,
+    )
+
+    # Add isolated-reference RMSD + EDA to the main descriptor table.
+    add_eda_and_isolated_metrics_to_model_rows(model_rows, eda_data, isolated_metrics)
+    write_structure_metrics_summary(model_rows)
+    write_isolated_rmsd_summary(selected_names, isolated_metrics, eda_data)
+    pair_rows = write_eda_and_distortion_outputs(selected_names, eda_data)
+    write_descriptor_chinese_dictionary(model_rows)
+    write_pairwise_descriptor_differences(selected_names, model_rows)
+    write_comprehensive_report_v12_5(
+        selected_names, model_rows, eda_data, pair_rows,
+        structures, mappings, phenyl_ring_ref,
+    )
+
+    # Missing EDA values are reported explicitly; no fuzzy structure-name matching.
+    missing = []
+    required = ["prep_cat", "prep_sub"]
+    for name in selected_names:
+        for key in required:
+            if key not in eda_data.get(name, {}):
+                missing.append(f"{name}:{key}")
+
+    print()
+    print("=" * 88)
+    print("V12.5 ANALYSIS DONE")
+    print("=" * 88)
+    print("Selected:", ", ".join(selected_names))
+    print("Mapping reference used only for atom correspondence / V11 cross-structure descriptors:", REFERENCE)
+    print("Preparation/deformation references:")
+    print("  catalyst ->", CAT_REFERENCE_XYZ)
+    print("  substrate ->", SUB_REFERENCE_XYZ)
+    print("EDA table ->", EDA_TABLE)
+    print("Output directory ->", outdir)
+    print()
+    print("Key outputs:")
+    print(f"  {MODEL_OUT}                 full V11 descriptors + isolated RMSD + EDA")
+    print(f"  {EDA_SELECTED_OUT}          selected structures, copied EDA/preparation values")
+    print(f"  {EDA_PAIRWISE_OUT}          every selected A-B energy difference")
+    print(f"  {DISTORTION_SUMMARY_OUT}    catalyst vs substrate distortion dominance")
+    print(f"  {ISOLATED_RMSD_OUT}         RMSD vs isolated caT.XYZ / sub.xyz")
+    print(f"  {CAT_ATOM_DISP_OUT}         atom ranks vs isolated catalyst (NOT TS-vs-TS)")
+    print(f"  {SUB_ATOM_DISP_OUT}         atom ranks vs isolated substrate (NOT TS-vs-TS)")
+    print(f"  {COMPARISON_REPORT_OUT}     integrated geometry/contact/EDA/distortion report")
+    print(f"  {DESCRIPTOR_CN_OUT}         every model descriptor with Chinese annotation")
+    print(f"  {PAIRWISE_DESCRIPTOR_OUT}   every numeric descriptor A-B difference + Chinese note")
+    print(f"  {BSA_ATOM_CONTRIB_OUT}      atom-resolved phenyl-ligand buried-SASA contributions")
+    print()
+    print("Important interpretation:")
+    print("  per-atom RMSD^2 contribution localizes geometric deformation; it is not an atomic energy decomposition")
+    print("  pairwise distortion dominance compares |delta prep_cat| with |delta prep_sub|")
+    print("  exact structure names are enforced; e.g. step_S_Q3 is never treated as step_S_Q4")
+    if missing:
+        print("WARNING: EDA table lacks fragment preparation values for:", ", ".join(missing))
+
+
+if __name__ == "__main__":
+    main()
