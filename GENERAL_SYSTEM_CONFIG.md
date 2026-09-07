@@ -11,6 +11,9 @@ One invocation must contain structures with the same molecular connectivity and
 atom partition. Run different substrate/catalyst families separately when their
 connectivity differs, then compare their CSV outputs. Atom numbers below are
 one-based XYZ indices and must be replaced with indices from the user's files.
+Contiguous atom sets may be written compactly as a quoted inclusive range, for
+example `"ligand": "2-62"`. Do not write bare `2-62`, which is invalid JSON.
+Explicit arrays and mixed arrays such as `[1, "3-8", 12]` are also accepted.
 
 The isolated catalyst reference must retain the catalyst atom ordering used at
 the beginning of each TS. The isolated substrate may have another ordering; it

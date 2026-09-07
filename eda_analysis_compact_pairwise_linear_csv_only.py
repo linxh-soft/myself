@@ -191,12 +191,24 @@ EDA_OUTPUT_NAMES = {
 
 
 def _int_list(value, label, min_size=1):
-    if not isinstance(value, list) or len(value) < min_size:
-        raise RuntimeError(f"{label} must be a JSON array with at least {min_size} atom indices")
+    """Parse atom ids from JSON arrays and compact inclusive ranges such as "2-62"."""
+    values = value if isinstance(value, list) else [value]
+    result = []
     try:
-        result = [int(x) for x in value]
+        for item in values:
+            if isinstance(item, str) and re.fullmatch(r"\s*\d+\s*-\s*\d+\s*", item):
+                start, end = (int(x.strip()) for x in item.split("-", 1))
+                if end < start:
+                    raise RuntimeError(f"{label} contains a descending atom range: {item!r}")
+                result.extend(range(start, end + 1))
+            else:
+                result.append(int(item))
     except (TypeError, ValueError) as exc:
-        raise RuntimeError(f"{label} contains a non-integer atom index") from exc
+        raise RuntimeError(
+            f'{label} must contain integer atom indices or quoted ranges such as "2-62"'
+        ) from exc
+    if len(result) < min_size:
+        raise RuntimeError(f"{label} must contain at least {min_size} atom indices")
     if len(result) != len(set(result)) or min(result) < 1:
         raise RuntimeError(f"{label} atom indices must be unique positive integers")
     return result
